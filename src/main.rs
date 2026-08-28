@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod actions;
 mod search;
 
 #[derive(Clone)]
@@ -59,7 +60,18 @@ async fn main() {
         let site = site.clone();
         move |req: Request<Body>| {
             let site = site.clone();
-            async move { route(&site, req.uri().path()) }
+            async move {
+                let method = req.method().clone();
+                let path = req.uri().path().to_string();
+                let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+                match method.as_str() {
+                    "GET" | "HEAD" => route(&site, &path),
+                    "PUT" | "DELETE" => write_route(&site, method.as_str(), &path, &body),
+                    _ => not_found("Page not found"),
+                }
+            }
         }
     });
 
@@ -67,6 +79,56 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     eprintln!("sweet-server (read-only) on http://{addr} serving {:?}", site.data);
     axum::serve(listener, app).await.unwrap();
+}
+
+/// PUT /page/:slug/action, DELETE /:slug.json, DELETE /recycler/:slug.json
+/// — the L2 write surface (server.js:847,986,628).
+fn write_route(site: &Site, method: &str, path: &str, body: &[u8]) -> Response {
+    let plain = |status: u16, text: String| {
+        Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+            .body(Body::from(text))
+            .unwrap()
+    };
+    match method {
+        "PUT" => {
+            let Some(slug) = path
+                .strip_prefix("/page/")
+                .and_then(|r| r.strip_suffix("/action"))
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+            else {
+                return not_found("Page not found");
+            };
+            let Some(action) = actions::parse_action(body) else {
+                return plain(500, "Server bad action".into());
+            };
+            match actions::apply(site, slug, action) {
+                actions::Outcome::Ok => plain(200, "ok".into()),
+                actions::Outcome::Error(status, text) => plain(status, text),
+            }
+        }
+        "DELETE" => {
+            if let Some(slug) = path
+                .strip_prefix("/recycler/")
+                .and_then(|r| r.strip_suffix(".json"))
+            {
+                return match actions::recycler_purge(site, slug) {
+                    Ok(()) => plain(200, String::new()),
+                    Err((status, text)) => plain(status, text),
+                };
+            }
+            if let Some(slug) = path.strip_prefix("/").and_then(|r| r.strip_suffix(".json")) {
+                if !slug.contains('/') {
+                    return match actions::delete_page(site, slug) {
+                        Ok(()) => plain(200, String::new()),
+                        Err((status, text)) => plain(status, text),
+                    };
+                }
+            }
+            not_found("Page not found")
+        }
+        _ => not_found("Page not found"),
+    }
 }
 
 fn route(site: &Site, path: &str) -> Response {
@@ -114,6 +176,13 @@ fn route(site: &Site, path: &str) -> Response {
             cors_json(Value::Object(map))
         }
         p if p.starts_with("/remote/") => remote_proxy(p),
+        "/recycler/system/slugs.json" => cors_json(actions::recycler_slugs(site)),
+        p if p.starts_with("/recycler/") && p.ends_with(".json") => {
+            match actions::recycler_page(site, &p["/recycler/".len()..p.len() - 5]) {
+                Some(bytes) => json_bytes(bytes),
+                None => not_found("Page not found"),
+            }
+        }
         p if p.starts_with("/assets/") => serve_file(site.data.join(&p[1..]), guess_mime(p)),
         p if p.starts_with("/theme/") => theme(site, p),
         p if p.starts_with("/plugins/") => plugin_static(site, p),
@@ -245,6 +314,9 @@ fn shell(site: &Site, pairs: &[(String, String)]) -> Response {
         .map(|n| format!("Wiki by: <span id='site-owner'>{n}</span></div>"))
         .unwrap_or_default();
     let owned = owner.is_some();
+    // isOwner=true mirrors the reference under --security_legacy: the shell
+    // must say owner or the client routes every edit to localStorage instead
+    // of PUTting it (wiki-client pageHandler.useLocalStorage)
     let body = format!(
         r#"<!DOCTYPE html>
 <html class='no-js'>
@@ -282,7 +354,7 @@ fn shell(site: &Site, pairs: &[(String, String)]) -> Response {
   <script>
   var isAuthenticated = false;
   var isClaimed = {owned};
-  var isOwner = false;
+  var isOwner = true;
   var ownerName = '{owner_name}';
   var seedNeighbors = '';
   var user = '';

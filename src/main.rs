@@ -472,6 +472,7 @@ fn shell(site: &Site, pairs: &[(String, String)], auth: Auth) -> Response {
     <footer>
       <div id='site-owner' class='footer-item'>
         {owner_footer}
+      </div>
       <div id='security' class='footer-item'></div>
       <span class='searchbox' class='footer-item'>
         &nbsp;

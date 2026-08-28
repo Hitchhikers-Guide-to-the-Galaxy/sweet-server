@@ -285,6 +285,21 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
         p if p.starts_with("/remote/") => remote_proxy(p),
         // recycler reads ride the same authorized middleware as writes
         // (server.js:577,582,617)
+        "/recycler/favicon.png" => {
+            // the recycler pane's header flag (server.js:576-579); the png
+            // ships in wiki-server's default-data
+            if !auth.authorized {
+                return security::forbidden();
+            }
+            match site
+                .defaults
+                .as_ref()
+                .and_then(|d| read(&d.join("status/recycler.png")))
+            {
+                Some(bytes) => serve_bytes(bytes, "image/png"),
+                None => not_found("Page not found"),
+            }
+        }
         "/recycler/system/slugs.json" => {
             if !auth.authorized {
                 return security::forbidden();
@@ -577,6 +592,26 @@ fn load_page(site: &Site, slug: &str) -> Option<Vec<u8>> {
     })
 }
 
+/// Third rung of the read-fallback chain (page.js:76-94, 289-291):
+/// installed plugins ship default pages in their pages/ dirs — Recent
+/// Changes comes from wiki-plugin-activity, Local Changes from
+/// wiki-plugin-changes. First plugin in scan order wins, and the served
+/// page is annotated with the plugin's short name.
+fn load_plugin_page(site: &Site, slug: &str) -> Option<Vec<u8>> {
+    if slug.is_empty() || slug.contains(['/', '.', '\\']) {
+        return None;
+    }
+    for (name, dir) in plugin_packages(site) {
+        if let Some(bytes) = read(&dir.join("pages").join(slug)) {
+            if let Ok(mut page) = serde_json::from_slice::<Value>(&bytes) {
+                page["plugin"] = Value::String(name);
+                return serde_json::to_vec(&page).ok();
+            }
+        }
+    }
+    None
+}
+
 fn page_json(site: &Site, slug: &str) -> Response {
     match load_page(site, slug) {
         // parse to guarantee we never serve a corrupt page as 200 —
@@ -585,7 +620,10 @@ fn page_json(site: &Site, slug: &str) -> Response {
             Ok(_) => json_bytes(bytes),
             Err(_) => not_found("Error Parsing Page"),
         },
-        None => not_found("Page not found"),
+        None => match load_plugin_page(site, slug) {
+            Some(bytes) => json_bytes(bytes),
+            None => not_found("Page not found"),
+        },
     }
 }
 

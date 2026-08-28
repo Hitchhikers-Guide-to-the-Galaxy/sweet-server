@@ -24,6 +24,9 @@ use std::sync::Arc;
 struct Site {
     data: PathBuf,
     defaults: Option<PathBuf>,
+    /// a node_modules dir holding wiki-client and wiki-plugin-* packages;
+    /// enables the native-hosted client (HTML shell, lineup, bundles)
+    vendor: Option<PathBuf>,
     home: String,
 }
 
@@ -31,12 +34,14 @@ struct Site {
 async fn main() {
     let mut data: Option<PathBuf> = None;
     let mut defaults: Option<PathBuf> = None;
+    let mut vendor: Option<PathBuf> = None;
     let mut port: u16 = 4251;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--data" => data = args.next().map(PathBuf::from),
             "--defaults" => defaults = args.next().map(PathBuf::from),
+            "--vendor" => vendor = args.next().map(PathBuf::from),
             "--port" => port = args.next().and_then(|p| p.parse().ok()).unwrap_or(4251),
             _ => {}
         }
@@ -44,6 +49,7 @@ async fn main() {
     let site = Arc::new(Site {
         data: data.expect("--data <site-dir> is required"),
         defaults,
+        vendor,
         home: "welcome-visitors".into(),
     });
 
@@ -67,6 +73,8 @@ fn route(site: &Site, path: &str) -> Response {
         "/favicon.png" => favicon(site),
         "/system/slugs.json" => cors_json(slugs(site)),
         "/system/sitemap.json" => cors_json(sitemap(site)),
+        "/system/plugins.json" => cors_json(plugin_names(site)),
+        "/system/factories.json" => cors_json(factories(site)),
         "/sitemap.xml" => sitemap_xml(site),
         "/system/site-index.json" => match read(&site.data.join("status/site-index.json")) {
             Some(b) => json_bytes(b),
@@ -74,8 +82,201 @@ fn route(site: &Site, path: &str) -> Response {
         },
         p if p.starts_with("/assets/") => serve_file(site.data.join(&p[1..]), guess_mime(p)),
         p if p.starts_with("/theme/") => theme(site, p),
+        p if p.starts_with("/plugins/") => plugin_static(site, p),
         p if p.ends_with(".json") && !p[1..].contains('/') => page_json(site, &p[1..p.len() - 5]),
-        _ => not_found("Page not found"),
+        p if p.ends_with(".html") && !p[1..].contains('/') => {
+            shell(site, &[("view".into(), p[1..p.len() - 5].to_string())])
+        }
+        p => {
+            // lineup URLs: alternating /loc/slug pairs, e.g.
+            // /view/welcome-visitors/localhost:4251/some-page (server.js:371)
+            if let Some(pairs) = parse_lineup(p) {
+                return shell(site, &pairs);
+            }
+            // wiki-client statics mounted at / (client.js, style/, js/, images/)
+            if let Some(client) = client_dir(site) {
+                let rel = &p[1..];
+                if !rel.contains("..") {
+                    if let Some(bytes) = read(&client.join(rel)) {
+                        return serve_bytes(bytes, guess_mime(p));
+                    }
+                }
+            }
+            not_found("Page not found")
+        }
+    }
+}
+
+// ------------------------------------------------------- native client shell
+
+fn client_dir(site: &Site) -> Option<PathBuf> {
+    site.vendor.as_ref().map(|v| v.join("wiki-client/client"))
+}
+
+/// Split a path into (loc, slug) pairs per the lineup regex — every odd
+/// segment a location (`view` or a site), every even one a slug.
+fn parse_lineup(path: &str) -> Option<Vec<(String, String)>> {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if segs.len() < 2 || segs.len() % 2 != 0 {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    for pair in segs.chunks(2) {
+        let (loc, slug) = (pair[0], pair[1]);
+        let loc_ok = loc
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ":.-".contains(c));
+        let slug_ok = slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !loc_ok || !slug_ok || loc == "plugin" || loc == "auth" {
+            return None;
+        }
+        pairs.push((loc.to_string(), slug.to_string()));
+    }
+    Some(pairs)
+}
+
+/// The static.html shell (wiki-client/views/static.html) with the page divs
+/// interpolated — the client boots from here and fetches page JSON itself.
+fn shell(site: &Site, pairs: &[(String, String)]) -> Response {
+    if client_dir(site).is_none() {
+        return not_found("Page not found"); // no vendor: read-only JSON server
+    }
+    let title = pairs
+        .last()
+        .map(|(_, s)| s.replace('-', " "))
+        .unwrap_or_default();
+    let owner = read(&site.data.join("status/owner.json"))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|o| o["name"].as_str().map(String::from));
+    let divs: String = pairs
+        .iter()
+        .map(|(loc, slug)| {
+            let origin = if loc == "view" {
+                String::new()
+            } else {
+                format!(" data-site={loc}")
+            };
+            format!(
+                "      <div class='page' id='{slug}' tabindex=\"-1\"{origin}>\n        <div class='paper'>\n        </div>\n      </div>\n"
+            )
+        })
+        .collect();
+    let owner_footer = owner
+        .as_deref()
+        .map(|n| format!("Wiki by: <span id='site-owner'>{n}</span></div>"))
+        .unwrap_or_default();
+    let owned = owner.is_some();
+    let body = format!(
+        r#"<!DOCTYPE html>
+<html class='no-js'>
+  <head>
+    <title>{title}</title>
+    <meta content='text/html; charset=UTF-8' http-equiv='Content-Type'>
+    <meta content='width=device-width, height=device-height, initial-scale=1.0, user-scalable=no' name='viewport'>
+    <link id='favicon' href='/favicon.png' rel='icon' type='image/png'>
+    <link href='/style/style.css' rel='stylesheet' type='text/css' media='screen'>
+    <link href='/theme/style.css' rel='stylesheet' type='text/css' media='screen'>
+    <link href='/style/print.css' rel='stylesheet' type='text/css' media='print'>
+    <link href='/js/jquery-ui/1.14.2/jquery-ui.min.css' rel='stylesheet' type='text/css'>
+    <script src='/js/jquery-4.0.0.js' type='text/javascript'></script>
+    <script src='/js/jquery-migrate-4.0.2.js' type='text/javascript'></script>
+    <script src='/js/jquery-ui/1.14.2/jquery-ui.min.js' type='text/javascript'></script>
+    <script src='/js/jquery.ui.touch-punch.min.js' type='text/javascript'></script>
+    <script src='/js/underscore-min.js' type='text/javascript'></script>
+    <script src='/client.js' type='text/javascript'></script>
+  </head>
+  <body>
+    <section class='main'>
+{divs}    </section>
+    <footer>
+      <div id='site-owner' class='footer-item'>
+        {owner_footer}
+      <div id='security' class='footer-item'></div>
+      <span class='searchbox' class='footer-item'>
+        &nbsp;
+        <input class='search' name='search' type='text' placeholder="Search">
+        &nbsp;
+        <span class='pages'></span>
+      </span>
+      <span class='neighborhood'></span>
+    </footer>
+  <script>
+  var isAuthenticated = false;
+  var isClaimed = {owned};
+  var isOwner = false;
+  var ownerName = '{owner_name}';
+  var seedNeighbors = '';
+  var user = '';
+  wiki.security(user);
+  </script>
+  </body>
+</html>"#,
+        owner_name = owner.as_deref().unwrap_or("")
+    );
+    with_cors(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(body))
+            .unwrap(),
+    )
+}
+
+fn plugin_packages(site: &Site) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(vendor) = &site.vendor {
+        if let Ok(entries) = std::fs::read_dir(vendor) {
+            let mut dirs: Vec<_> = entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("wiki-plugin-"))
+                .collect();
+            dirs.sort_by_key(|e| e.file_name());
+            for e in dirs {
+                let name = e.file_name().to_string_lossy()[12..].to_string();
+                out.push((name, e.path()));
+            }
+        }
+    }
+    out
+}
+
+fn plugin_names(site: &Site) -> Value {
+    Value::Array(
+        plugin_packages(site)
+            .into_iter()
+            .map(|(n, _)| Value::String(n))
+            .collect(),
+    )
+}
+
+fn factories(site: &Site) -> Value {
+    Value::Array(
+        plugin_packages(site)
+            .into_iter()
+            .filter_map(|(_, dir)| {
+                read(&dir.join("factory.json"))
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            })
+            .collect(),
+    )
+}
+
+/// /plugins/<name>/<file> from the vendored wiki-plugin-<name>/client dir
+/// (server.js:328-335).
+fn plugin_static(site: &Site, path: &str) -> Response {
+    let rest = &path["/plugins/".len()..];
+    let Some((name, file)) = rest.split_once('/') else {
+        return not_found("Not found");
+    };
+    if file.contains("..") {
+        return not_found("Not found");
+    }
+    match site.vendor.as_ref().and_then(|v| {
+        read(&v.join(format!("wiki-plugin-{name}/client")).join(file))
+    }) {
+        Some(bytes) => serve_bytes(bytes, guess_mime(path)),
+        None => not_found("Not found"),
     }
 }
 

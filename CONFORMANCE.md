@@ -9,9 +9,11 @@ Target: fedwiki-server (harness: ~/Code/conformance, ratchet:
 | L0    | t1-core-items | PASS   | 2026-08-28 |
 | L0    | t2-journal    | PASS   | 2026-08-28 |
 
-Next rung: L1 full read — HTML shell (`/:slug.html`), lineup URLs, client and
-plugin bundles, `/system/{export,factories,plugins}.json`, site-index
-*generation* (MiniSearch-compatible), `/remote/:site/:slug.json`.
+L1 partial (2026-08-28, later): native-hosted client — HTML shell,
+lineup URLs, client/plugin bundle statics, factories.json, plugins.json —
+verified in the browser (Server Lineup Test, both variants). Remaining for
+L1: site-index generation (MiniSearch-compatible), /system/export.json,
+/remote/:site/:slug.json, server-rendered story in /:slug.html.
 
 Run the candidate for the suite:
 

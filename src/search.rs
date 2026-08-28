@@ -31,7 +31,10 @@ fn extract_item_text(text: &str) -> String {
     static R8: OnceLock<Regex> = OnceLock::new();
 
     let t = re(&R1, r"\[([^\]]*?)\][\[(].*?[\])]").replace_all(text, " $1 ");
-    let t = re(&R2, r"\[\{2}|\[(?:\S+)|\]{1,2}").replace_all(&t, " ");
+    // JS: /\[{2}|\[(?:[\S]+)|\]{1,2}/ — "[[", then "[word", then "]"/"]]".
+    // (an escaped brace here once matched literal "[{2}" and silently ate
+    // the first word of every [[link]] — caught by the parity sweep)
+    let t = re(&R2, r"\[{2}|\[\S+|\]{1,2}").replace_all(&t, " ");
     let t = t.replace('\n', " ");
     let t = re(&R4, r"(?s)<style.*?</style>").replace_all(&t, " ");
     let t = re(&R5A, r#"<(?:"[^"]*"['"]*|'[^']*'['"]*|[^'">])+>"#).replace_all(&t, " ");
@@ -100,6 +103,16 @@ pub fn extract_page_text(page: &Value) -> String {
         }
     }
     out
+}
+
+/// JSON.stringify prints a whole Number without a decimal point — serde's
+/// f64 would print 2.0 where node prints 2.
+fn js_num(x: f64) -> Value {
+    if x.fract() == 0.0 && x.abs() < 9e15 {
+        json!(x as i64)
+    } else {
+        json!(x)
+    }
 }
 
 /// minisearch's default tokenizer: String.split(/[\n\r\p{Z}\p{P}]+/u) —
@@ -172,7 +185,7 @@ pub fn site_index(pages: &[(String, Value)]) -> Value {
         "documentIds": document_ids,
         "fieldIds": {"title": 0, "content": 1},
         "fieldLength": field_length,
-        "averageFieldLength": [avg[0], avg[1]],
+        "averageFieldLength": [js_num(avg[0]), js_num(avg[1])],
         "storedFields": {},
         "dirtCount": 0,
         "index": index_json,

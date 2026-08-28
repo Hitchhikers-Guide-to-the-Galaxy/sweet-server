@@ -1,11 +1,14 @@
-//! Sweet Server — Phase 2: a read-only Federated Wiki server.
+//! Sweet Server — a Federated Wiki server in Rust.
 //!
-//! Serves an existing site directory without writing to it: page JSON,
-//! system endpoints, favicon, assets, theme. Behaviour follows the
-//! Fedwiki Server Spec (wiki-server 0.27.0); parity is enforced by the
-//! conformance harness in ~/Code/conformance (L0 first).
+//! Serves a site directory: page JSON, system endpoints, favicon, assets,
+//! theme, the native-hosted client, the six-verb write path, friends
+//! security, and the assets plugin routes. Behaviour follows the Fedwiki
+//! Server Spec (wiki-server 0.27.0); parity is enforced by the conformance
+//! harness in ~/Code/conformance (green through L4).
 //!
-//! Usage: sweet-server --data <site-dir> [--port 4251] [--defaults <dir>]
+//! Usage: sweet-server --data <site-dir> [--port 4251] [--host 127.0.0.1]
+//!        [--defaults <dir>] [--vendor <node_modules>]
+//!        [--security_legacy | --security_type friends]
 //! `--defaults` points at wiki-server's default-data dir, which supplies
 //! the fallback pages (a missing slug may legitimately 200) and the
 //! default favicon — spec §3 read fallback chain.
@@ -13,7 +16,7 @@
 use axum::{
     body::Body,
     http::{header, HeaderValue, Request, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -41,6 +44,7 @@ async fn main() {
     let mut defaults: Option<PathBuf> = None;
     let mut vendor: Option<PathBuf> = None;
     let mut port: u16 = 4251;
+    let mut host: std::net::IpAddr = [127, 0, 0, 1].into();
     let mut security_type: Option<String> = None;
     let mut security_legacy = false;
     let mut args = std::env::args().skip(1);
@@ -50,6 +54,12 @@ async fn main() {
             "--defaults" => defaults = args.next().map(PathBuf::from),
             "--vendor" => vendor = args.next().map(PathBuf::from),
             "--port" => port = args.next().and_then(|p| p.parse().ok()).unwrap_or(4251),
+            "--host" => {
+                host = args
+                    .next()
+                    .and_then(|h| h.parse().ok())
+                    .expect("--host <ip> (e.g. 0.0.0.0)")
+            }
             "--security_type" => security_type = args.next(),
             "--security_legacy" => security_legacy = true,
             _ => {}
@@ -64,6 +74,9 @@ async fn main() {
         None if security_legacy => security::Mode::Legacy,
         None => security::Mode::Default,
     };
+    // multer's dest option creates assets/uploads at plugin startup — the
+    // assets list route then answers {error:null, files:[]} on a fresh site
+    let _ = std::fs::create_dir_all(data.join("assets/uploads"));
     let sec = security::Security::new(mode, &data.join("status/owner.json"));
     let site = Arc::new(Site {
         data,
@@ -89,6 +102,8 @@ async fn main() {
                 }
                 let cookie = header_str(&req, header::COOKIE);
                 let content_type = header_str(&req, header::CONTENT_TYPE);
+                let req_host = header_str(&req, header::HOST)
+                    .unwrap_or_else(|| "localhost".into());
                 let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
                     .await
                     .unwrap_or_default();
@@ -121,6 +136,7 @@ async fn main() {
                         let auth = Auth {
                             authorized,
                             user: site.security.user(cookie.as_deref()),
+                            host: req_host,
                         };
                         route(&site, &path, auth)
                     }
@@ -133,17 +149,19 @@ async fn main() {
         }
     });
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from((host, port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     eprintln!("sweet-server (read-only) on http://{addr} serving {:?}", site.data);
     axum::serve(listener, app).await.unwrap();
 }
 
-/// Owner/session facts a read route needs: recycler gating and the shell.
-#[derive(Clone, Copy)]
+/// Per-request facts the read routes need: recycler gating, the shell's
+/// owner variables, and the Host header (absolute urls in sitemap.xml).
+#[derive(Clone)]
 struct Auth {
     authorized: bool,
     user: bool,
+    host: String,
 }
 
 fn must_be_owner() -> Response {
@@ -159,11 +177,16 @@ fn must_be_owner() -> Response {
 /// route pattern matches, like express middleware: an unmatched path is
 /// 404 whoever asks; a matched one is 403 without authority.
 fn write_route(site: &Site, method: &str, path: &str, body: &[u8], authorized: bool) -> Response {
+    // express res.send(string) stamps text/html — but the error helper
+    // res.e finishes with res.end(), which sets NO content-type. Every
+    // res.e body in the action route starts "Server " (server.js:850-900).
     let plain = |status: u16, text: String| {
-        Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-            .body(Body::from(text))
-            .unwrap()
+        let mut b = Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+        if !text.starts_with("Server ") {
+            b = b.header(header::CONTENT_TYPE, "text/html; charset=utf-8");
+        }
+        b.body(Body::from(text)).unwrap()
     };
     match method {
         "PUT" => {
@@ -241,7 +264,7 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
         }
         "/system/plugins.json" => cors_json(plugin_names(site)),
         "/system/factories.json" => cors_json(factories(site)),
-        "/sitemap.xml" => sitemap_xml(site),
+        "/sitemap.xml" => sitemap_xml(site, &auth.host),
         "/system/site-index.json" => {
             let idx = match read(&site.data.join("status/site-index.json"))
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -265,6 +288,19 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
         "/recycler/system/slugs.json" => {
             if !auth.authorized {
                 return security::forbidden();
+            }
+            // quirk kept: a site that never recycled has no recycle dir and
+            // the reference's readdir errors out as a 500 (server.js:583-586)
+            let recycle = site.data.join("recycle");
+            if !recycle.is_dir() {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(Body::from(format!(
+                        "Server Error: ENOENT: no such file or directory, scandir '{}'",
+                        recycle.display()
+                    )))
+                    .unwrap();
             }
             cors_json(actions::recycler_slugs(site))
         }
@@ -575,10 +611,11 @@ fn site_pages(site: &Site) -> Vec<(String, Value)> {
 }
 
 fn slugs(site: &Site) -> Value {
+    // an array of bare slug strings (parity sweep vs 0.40.2)
     Value::Array(
         site_pages(site)
             .into_iter()
-            .map(|(slug, page)| json!({"slug": slug, "title": page["title"]}))
+            .map(|(slug, _)| Value::String(slug))
             .collect(),
     )
 }
@@ -627,20 +664,33 @@ fn last_edit_date(page: &Value) -> Value {
 
 /// First textual item's text — mirrors wiki-client synopsis.js closely
 /// enough for L0; exact parity is a diff-mode concern.
+/// wiki-client/lib/synopsis.js verbatim: the synopsis field, else the
+/// first/second item — paragraphs preferred over anything with text —
+/// else a count; then first line only, capped at 560.
 fn synopsis(page: &Value) -> Value {
-    if let Some(story) = page["story"].as_array() {
-        for item in story {
-            if matches!(item["type"].as_str(), Some("paragraph") | Some("markdown")) {
-                if let Some(t) = item["text"].as_str() {
-                    return Value::String(t.chars().take(560).collect());
-                }
-            }
+    let text = (|| {
+        if let Some(s) = page["synopsis"].as_str() {
+            return s.to_string();
         }
-    }
-    Value::String(format!(
-        "A page with {} items.",
-        page["story"].as_array().map(|s| s.len()).unwrap_or(0)
-    ))
+        let Some(story) = page["story"].as_array() else {
+            return "A page with no story.".into();
+        };
+        let get = |i: usize| story.get(i);
+        let para = |i: usize| {
+            get(i)
+                .filter(|it| it["type"] == "paragraph")
+                .and_then(|it| it["text"].as_str())
+        };
+        let any_text = |i: usize| get(i).and_then(|it| it["text"].as_str());
+        para(0)
+            .or_else(|| para(1))
+            .or_else(|| any_text(0))
+            .or_else(|| any_text(1))
+            .map(String::from)
+            .unwrap_or_else(|| format!("A page with {} items.", story.len()))
+    })();
+    let first_line = text.trim().split(['\r', '\n']).next().unwrap_or("");
+    Value::String(first_line.chars().take(560).collect())
 }
 
 /// links maps each [[coined]] slug to the id of the item that coined it
@@ -649,7 +699,15 @@ fn links(page: &Value) -> Value {
     let mut map = serde_json::Map::new();
     if let Some(story) = page["story"].as_array() {
         for item in story {
-            let (Some(text), Some(id)) = (item["text"].as_str(), item["id"].as_str()) else {
+            let Some(id) = item["id"].as_str() else { continue };
+            // a reference item links to its target by slug (sitemap.js:64-68)
+            if item["type"] == "reference" {
+                if let Some(slug) = item["slug"].as_str() {
+                    map.entry(slug.to_string())
+                        .or_insert_with(|| Value::String(id.into()));
+                }
+            }
+            let Some(text) = item["text"].as_str() else {
                 continue;
             };
             let mut rest = text;
@@ -676,13 +734,31 @@ fn as_slug(title: &str) -> String {
         .to_lowercase()
 }
 
-fn sitemap_xml(site: &Site) -> Response {
-    let urls: String = site_pages(site)
-        .iter()
-        .map(|(slug, _)| format!("<url><loc>/{slug}.html</loc></url>"))
-        .collect();
+fn sitemap_xml(site: &Site, host: &str) -> Response {
+    // the reference's exact shape: standalone declaration, two-space
+    // indent, absolute http://<host> locs, lastmod = entry date YYYY-MM-DD
+    let urls: String = sitemap(site)
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let slug = e["slug"].as_str()?;
+                    let lastmod = e["date"]
+                        .as_u64()
+                        .map(|ms| {
+                            format!("\n    <lastmod>{}</lastmod>", ymd(ms))
+                        })
+                        .unwrap_or_default();
+                    Some(format!(
+                        "\n  <url>\n    <loc>http://{host}/{slug}.html</loc>{lastmod}\n  </url>"
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">{urls}</urlset>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">{urls}\n</urlset>"
     );
     with_cors(
         Response::builder()
@@ -690,6 +766,45 @@ fn sitemap_xml(site: &Site) -> Response {
             .body(Body::from(body))
             .unwrap(),
     )
+}
+
+/// ms-epoch -> UTC YYYY-MM-DD (Date.toISOString().substring(0,10))
+fn ymd(ms: u64) -> String {
+    let days = (ms / 86_400_000) as i64;
+    let mut y = 1970i64;
+    let mut d = days;
+    loop {
+        let len = if leap(y) { 366 } else { 365 };
+        if d < len {
+            break;
+        }
+        d -= len;
+        y += 1;
+    }
+    let months = [
+        31,
+        if leap(y) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut m = 0usize;
+    while d >= months[m] {
+        d -= months[m];
+        m += 1;
+    }
+    format!("{y:04}-{:02}-{:02}", m + 1, d + 1)
+}
+
+fn leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 // ---------------------------------------------------------------- statics
@@ -830,5 +945,10 @@ fn serve_bytes(bytes: Vec<u8>, mime: &str) -> Response {
 /// Plain-text 404 with the exact reference body — the harness asserts
 /// the string "Page not found" verbatim.
 fn not_found(msg: &'static str) -> Response {
-    (StatusCode::NOT_FOUND, msg).into_response()
+    // express res.send(string) stamps text/html on plain-text bodies
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(msg))
+        .unwrap()
 }

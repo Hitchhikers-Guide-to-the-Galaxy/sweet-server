@@ -8,6 +8,8 @@ description = "A Federated Wiki server in Rust — Phase 2: read-only. Conforman
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 serde_json = "1"
+regex = "1"
+ureq = { version = "2", default-features = false }
 
 [profile.release]
 strip = true

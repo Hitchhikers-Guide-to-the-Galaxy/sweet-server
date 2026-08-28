@@ -13,12 +13,14 @@
 use axum::{
     body::Body,
     http::{header, HeaderValue, Request, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
 };
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod search;
 
 #[derive(Clone)]
 struct Site {
@@ -69,20 +71,67 @@ async fn main() {
 
 fn route(site: &Site, path: &str) -> Response {
     match path {
-        "/" => Redirect::temporary(&format!("/{}.html", site.home)).into_response(),
+        // 302, like express res.redirect; /assets/home/index.html wins if present
+        "/" => {
+            let loc = if site.data.join("assets/home/index.html").is_file() {
+                "/assets/home/index.html".to_string()
+            } else {
+                format!("/{}.html", site.home)
+            };
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, loc)
+                .body(Body::empty())
+                .unwrap()
+        }
         "/favicon.png" => favicon(site),
         "/system/slugs.json" => cors_json(slugs(site)),
-        "/system/sitemap.json" => cors_json(sitemap(site)),
+        // Last-Modified is load-bearing: the client's neighborhood accepts a
+        // sitemap only when Date.parse(Last-Modified) beats its cached value
+        // (wiki-client neighborhood.js refreshMap) — omit it and search dies
+        "/system/sitemap.json" => {
+            let map = sitemap(site);
+            with_last_modified(cors_json(map.clone()), max_date(&map))
+        }
         "/system/plugins.json" => cors_json(plugin_names(site)),
         "/system/factories.json" => cors_json(factories(site)),
         "/sitemap.xml" => sitemap_xml(site),
-        "/system/site-index.json" => match read(&site.data.join("status/site-index.json")) {
-            Some(b) => json_bytes(b),
-            None => not_found("Site index not found"),
-        },
+        "/system/site-index.json" => {
+            let idx = match read(&site.data.join("status/site-index.json"))
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            {
+                Some(v) => v,
+                None => search::site_index(&site_pages(site)),
+            };
+            let stamp = max_date(&sitemap(site));
+            with_last_modified(cors_json(idx), stamp)
+        }
+        "/system/export.json" => {
+            let mut map = serde_json::Map::new();
+            for (slug, page) in site_pages(site) {
+                map.insert(slug, page);
+            }
+            cors_json(Value::Object(map))
+        }
+        p if p.starts_with("/remote/") => remote_proxy(p),
         p if p.starts_with("/assets/") => serve_file(site.data.join(&p[1..]), guess_mime(p)),
         p if p.starts_with("/theme/") => theme(site, p),
         p if p.starts_with("/plugins/") => plugin_static(site, p),
+        // security module's client (server.js:337-340; friends by default)
+        p if p.starts_with("/security/") => {
+            let file = &p["/security/".len()..];
+            if file.contains("..") {
+                return not_found("Not found");
+            }
+            match site
+                .vendor
+                .as_ref()
+                .and_then(|v| read(&v.join("wiki-security-friends/client").join(file)))
+            {
+                Some(bytes) => serve_bytes(bytes, guess_mime(p)),
+                None => not_found("Not found"),
+            }
+        }
         p if p.ends_with(".json") && !p[1..].contains('/') => page_json(site, &p[1..p.len() - 5]),
         p if p.ends_with(".html") && !p[1..].contains('/') => {
             shell(site, &[("view".into(), p[1..p.len() - 5].to_string())])
@@ -104,6 +153,34 @@ fn route(site: &Site, path: &str) -> Response {
             }
             not_found("Page not found")
         }
+    }
+}
+
+/// GET /remote/:site/:slug.json — proxy a remote page over plain http with
+/// a short timeout, exactly the reference's shape (server.js:489, 2s).
+fn remote_proxy(path: &str) -> Response {
+    let rest = &path["/remote/".len()..];
+    let Some((remote_site, file)) = rest.split_once('/') else {
+        return not_found("Page not found");
+    };
+    if !file.ends_with(".json") || file.contains('/') {
+        return not_found("Page not found");
+    }
+    let url = format!("http://{remote_site}/{file}");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+    match agent.get(&url).call() {
+        Ok(resp) => {
+            let mut body = Vec::new();
+            use std::io::Read;
+            if resp.into_reader().read_to_end(&mut body).is_ok() {
+                json_bytes(body)
+            } else {
+                not_found("Page not found")
+            }
+        }
+        Err(_) => not_found("Page not found"),
     }
 }
 
@@ -498,6 +575,54 @@ fn guess_mime(path: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------- plumbing
+
+fn max_date(sitemap: &Value) -> u64 {
+    sitemap
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e["date"].as_u64())
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+/// RFC 7231 IMF-fixdate from epoch milliseconds, no external crates.
+fn http_date(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (s, m, h) = (secs % 60, (secs / 60) % 60, (secs / 3600) % 24);
+    let days = (secs / 86400) as i64;
+    // Howard Hinnant's civil_from_days
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    let weekday = (days + 4).rem_euclid(7) as usize; // 1970-01-01 was a Thursday
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MO: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        WD[weekday], d, MO[(month - 1) as usize], year, h, m, s
+    )
+}
+
+fn with_last_modified(mut resp: Response, ms: u64) -> Response {
+    if ms > 0 {
+        if let Ok(v) = HeaderValue::from_str(&http_date(ms)) {
+            resp.headers_mut().insert(header::LAST_MODIFIED, v);
+        }
+    }
+    resp
+}
 
 fn read(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()

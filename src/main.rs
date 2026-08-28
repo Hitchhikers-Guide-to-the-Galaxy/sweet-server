@@ -21,9 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod actions;
+mod assets;
 mod search;
+mod security;
 
-#[derive(Clone)]
 struct Site {
     data: PathBuf,
     defaults: Option<PathBuf>,
@@ -31,6 +32,7 @@ struct Site {
     /// enables the native-hosted client (HTML shell, lineup, bundles)
     vendor: Option<PathBuf>,
     home: String,
+    security: security::Security,
 }
 
 #[tokio::main]
@@ -39,6 +41,8 @@ async fn main() {
     let mut defaults: Option<PathBuf> = None;
     let mut vendor: Option<PathBuf> = None;
     let mut port: u16 = 4251;
+    let mut security_type: Option<String> = None;
+    let mut security_legacy = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -46,14 +50,27 @@ async fn main() {
             "--defaults" => defaults = args.next().map(PathBuf::from),
             "--vendor" => vendor = args.next().map(PathBuf::from),
             "--port" => port = args.next().and_then(|p| p.parse().ok()).unwrap_or(4251),
+            "--security_type" => security_type = args.next(),
+            "--security_legacy" => security_legacy = true,
             _ => {}
         }
     }
+    let data = data.expect("--data <site-dir> is required");
+    // mode selection mirrors the reference CLI: --security_type wins,
+    // --security_legacy softens the default stub, else read-only (spec §6.2)
+    let mode = match security_type.as_deref() {
+        Some(t) if t.contains("friends") => security::Mode::Friends,
+        Some(other) => panic!("unsupported security_type {other:?} (only friends)"),
+        None if security_legacy => security::Mode::Legacy,
+        None => security::Mode::Default,
+    };
+    let sec = security::Security::new(mode, &data.join("status/owner.json"));
     let site = Arc::new(Site {
-        data: data.expect("--data <site-dir> is required"),
+        data,
         defaults,
         vendor,
         home: "welcome-visitors".into(),
+        security: sec,
     });
 
     let app = axum::Router::new().fallback({
@@ -63,12 +80,53 @@ async fn main() {
             async move {
                 let method = req.method().clone();
                 let path = req.uri().path().to_string();
+                let query = req.uri().query().unwrap_or("").to_string();
+                fn header_str(req: &Request<Body>, name: header::HeaderName) -> Option<String> {
+                    req.headers()
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from)
+                }
+                let cookie = header_str(&req, header::COOKIE);
+                let content_type = header_str(&req, header::CONTENT_TYPE);
                 let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
                     .await
                     .unwrap_or_default();
-                match method.as_str() {
-                    "GET" | "HEAD" => route(&site, &path),
-                    "PUT" | "DELETE" => write_route(&site, method.as_str(), &path, &body),
+                let authorized = site.security.is_authorized(cookie.as_deref());
+                let assets_root = site.data.join("assets");
+                match (method.as_str(), path.as_str()) {
+                    // friends security routes (spec §6.3)
+                    ("POST", "/login") => {
+                        let _ = std::fs::create_dir_all(site.data.join("status"));
+                        site.security.login(&site.data.join("status/owner.json"))
+                    }
+                    ("GET" | "HEAD", "/logout") => site.security.logout(cookie.as_deref()),
+                    ("POST", "/auth/reclaim/") => site.security.reclaim(&body),
+                    // assets plugin routes (wiki-plugin-assets 0.7.4)
+                    ("GET" | "HEAD", "/plugin/assets/list") => assets::list(&assets_root, &query),
+                    ("GET" | "HEAD", "/plugin/assets/index") => assets::index(&assets_root),
+                    ("POST", "/plugin/assets/upload") => {
+                        if !authorized {
+                            return must_be_owner();
+                        }
+                        assets::upload(&assets_root, content_type.as_deref(), body).await
+                    }
+                    ("POST", "/plugin/assets/delete") => {
+                        if !authorized {
+                            return must_be_owner();
+                        }
+                        assets::delete(&assets_root, &query)
+                    }
+                    ("GET" | "HEAD", _) => {
+                        let auth = Auth {
+                            authorized,
+                            user: site.security.user(cookie.as_deref()),
+                        };
+                        route(&site, &path, auth)
+                    }
+                    ("PUT" | "DELETE", _) => {
+                        write_route(&site, method.as_str(), &path, &body, authorized)
+                    }
                     _ => not_found("Page not found"),
                 }
             }
@@ -81,9 +139,26 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Owner/session facts a read route needs: recycler gating and the shell.
+#[derive(Clone, Copy)]
+struct Auth {
+    authorized: bool,
+    user: bool,
+}
+
+fn must_be_owner() -> Response {
+    // the assets plugin's own gate (server.js bundle: status(403).send)
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(Body::from("must be owner"))
+        .unwrap()
+}
+
 /// PUT /page/:slug/action, DELETE /:slug.json, DELETE /recycler/:slug.json
-/// — the L2 write surface (server.js:847,986,628).
-fn write_route(site: &Site, method: &str, path: &str, body: &[u8]) -> Response {
+/// — the L2 write surface (server.js:847,986,628). Auth gates AFTER the
+/// route pattern matches, like express middleware: an unmatched path is
+/// 404 whoever asks; a matched one is 403 without authority.
+fn write_route(site: &Site, method: &str, path: &str, body: &[u8], authorized: bool) -> Response {
     let plain = |status: u16, text: String| {
         Response::builder()
             .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
@@ -99,6 +174,9 @@ fn write_route(site: &Site, method: &str, path: &str, body: &[u8]) -> Response {
             else {
                 return not_found("Page not found");
             };
+            if !authorized {
+                return security::forbidden();
+            }
             let Some(action) = actions::parse_action(body) else {
                 return plain(500, "Server bad action".into());
             };
@@ -112,6 +190,9 @@ fn write_route(site: &Site, method: &str, path: &str, body: &[u8]) -> Response {
                 .strip_prefix("/recycler/")
                 .and_then(|r| r.strip_suffix(".json"))
             {
+                if !authorized {
+                    return security::forbidden();
+                }
                 return match actions::recycler_purge(site, slug) {
                     Ok(()) => plain(200, String::new()),
                     Err((status, text)) => plain(status, text),
@@ -119,6 +200,9 @@ fn write_route(site: &Site, method: &str, path: &str, body: &[u8]) -> Response {
             }
             if let Some(slug) = path.strip_prefix("/").and_then(|r| r.strip_suffix(".json")) {
                 if !slug.contains('/') {
+                    if !authorized {
+                        return security::forbidden();
+                    }
                     return match actions::delete_page(site, slug) {
                         Ok(()) => plain(200, String::new()),
                         Err((status, text)) => plain(status, text),
@@ -131,7 +215,7 @@ fn write_route(site: &Site, method: &str, path: &str, body: &[u8]) -> Response {
     }
 }
 
-fn route(site: &Site, path: &str) -> Response {
+fn route(site: &Site, path: &str, auth: Auth) -> Response {
     match path {
         // 302, like express res.redirect; /assets/home/index.html wins if present
         "/" => {
@@ -176,8 +260,18 @@ fn route(site: &Site, path: &str) -> Response {
             cors_json(Value::Object(map))
         }
         p if p.starts_with("/remote/") => remote_proxy(p),
-        "/recycler/system/slugs.json" => cors_json(actions::recycler_slugs(site)),
+        // recycler reads ride the same authorized middleware as writes
+        // (server.js:577,582,617)
+        "/recycler/system/slugs.json" => {
+            if !auth.authorized {
+                return security::forbidden();
+            }
+            cors_json(actions::recycler_slugs(site))
+        }
         p if p.starts_with("/recycler/") && p.ends_with(".json") => {
+            if !auth.authorized {
+                return security::forbidden();
+            }
             match actions::recycler_page(site, &p["/recycler/".len()..p.len() - 5]) {
                 Some(bytes) => json_bytes(bytes),
                 None => not_found("Page not found"),
@@ -203,13 +297,13 @@ fn route(site: &Site, path: &str) -> Response {
         }
         p if p.ends_with(".json") && !p[1..].contains('/') => page_json(site, &p[1..p.len() - 5]),
         p if p.ends_with(".html") && !p[1..].contains('/') => {
-            shell(site, &[("view".into(), p[1..p.len() - 5].to_string())])
+            shell(site, &[("view".into(), p[1..p.len() - 5].to_string())], auth)
         }
         p => {
             // lineup URLs: alternating /loc/slug pairs, e.g.
             // /view/welcome-visitors/localhost:4251/some-page (server.js:371)
             if let Some(pairs) = parse_lineup(p) {
-                return shell(site, &pairs);
+                return shell(site, &pairs, auth);
             }
             // wiki-client statics mounted at / (client.js, style/, js/, images/)
             if let Some(client) = client_dir(site) {
@@ -285,7 +379,7 @@ fn parse_lineup(path: &str) -> Option<Vec<(String, String)>> {
 
 /// The static.html shell (wiki-client/views/static.html) with the page divs
 /// interpolated — the client boots from here and fetches page JSON itself.
-fn shell(site: &Site, pairs: &[(String, String)]) -> Response {
+fn shell(site: &Site, pairs: &[(String, String)], auth: Auth) -> Response {
     if client_dir(site).is_none() {
         return not_found("Page not found"); // no vendor: read-only JSON server
     }
@@ -293,9 +387,7 @@ fn shell(site: &Site, pairs: &[(String, String)]) -> Response {
         .last()
         .map(|(_, s)| s.replace('-', " "))
         .unwrap_or_default();
-    let owner = read(&site.data.join("status/owner.json"))
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|o| o["name"].as_str().map(String::from));
+    let owner = site.security.owner_name();
     let divs: String = pairs
         .iter()
         .map(|(loc, slug)| {
@@ -314,9 +406,11 @@ fn shell(site: &Site, pairs: &[(String, String)]) -> Response {
         .map(|n| format!("Wiki by: <span id='site-owner'>{n}</span></div>"))
         .unwrap_or_default();
     let owned = owner.is_some();
-    // isOwner=true mirrors the reference under --security_legacy: the shell
-    // must say owner or the client routes every edit to localStorage instead
-    // of PUTting it (wiki-client pageHandler.useLocalStorage)
+    // the script block mirrors static.html's mustache output exactly:
+    // var isOwner = ('{{isOwner}}' === "true") with booleans rendered as
+    // "true"/"false" strings. isOwner must be truthful (server.js:392) —
+    // when false the client routes edits to localStorage instead of PUTting
+    // them (wiki-client pageHandler.useLocalStorage, pinned finding)
     let body = format!(
         r#"<!DOCTYPE html>
 <html class='no-js'>
@@ -352,16 +446,19 @@ fn shell(site: &Site, pairs: &[(String, String)]) -> Response {
       <span class='neighborhood'></span>
     </footer>
   <script>
-  var isAuthenticated = false;
-  var isClaimed = {owned};
-  var isOwner = true;
+  var isAuthenticated = ('{authenticated}' === "true");
+  var isClaimed = ('{owned}' === "true");
+  var isOwner = ('{is_owner}' === "true");
   var ownerName = '{owner_name}';
   var seedNeighbors = '';
-  var user = '';
+  var user = '{user}'
   wiki.security(user);
   </script>
   </body>
 </html>"#,
+        authenticated = auth.user,
+        is_owner = auth.authorized,
+        user = if auth.user { "true" } else { "" },
         owner_name = owner.as_deref().unwrap_or("")
     );
     with_cors(

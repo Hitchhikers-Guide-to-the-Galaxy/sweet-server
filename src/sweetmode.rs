@@ -41,6 +41,10 @@ fn index_html(site: &Site, dist: &Path) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        // the shell must never cache: it names hashed bundles that change
+        // on every deploy — a heuristically-cached shell 404s its own app
+        // (bit us live, 2026-08-29)
+        .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(html))
         .unwrap()
 }
@@ -96,10 +100,19 @@ pub fn route(
             if rel.contains("..") {
                 return Some(not_found("Not found"));
             }
-            Some(
-                file(&dist.join("app").join(rel), guess_mime(p), false)
-                    .unwrap_or_else(|| not_found("Not found")),
-            )
+            // hash-named, content-addressed: cache forever
+            Some(match file(&dist.join("app").join(rel), guess_mime(p), false) {
+                Some(mut resp) => {
+                    resp.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static(
+                            "public, max-age=31536000, immutable",
+                        ),
+                    );
+                    resp
+                }
+                None => not_found("Not found"),
+            })
         }
         ("GET" | "HEAD", p) if p.starts_with("/plugins/") => {
             let rel = &p["/plugins/".len()..];

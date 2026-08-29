@@ -41,6 +41,9 @@ struct Site {
     /// sweet-client mode: serve the Sweet Client build as this site's shell
     sweet_client: Option<PathBuf>,
     sweet_plugins: Option<PathBuf>,
+    /// comma-separated neighborhood seed injected into the shell, like the
+    /// node server's argv.neighbors -> seedNeighbors
+    neighbors: Option<String>,
 }
 
 #[tokio::main]
@@ -54,6 +57,7 @@ async fn main() {
     let mut security_legacy = false;
     let mut sweet_client: Option<PathBuf> = None;
     let mut sweet_plugins: Option<PathBuf> = None;
+    let mut neighbors: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -71,6 +75,7 @@ async fn main() {
             "--security_legacy" => security_legacy = true,
             "--sweet-client" => sweet_client = args.next().map(PathBuf::from),
             "--sweet-plugins" => sweet_plugins = args.next().map(PathBuf::from),
+            "--neighbors" => neighbors = args.next(),
             _ => {}
         }
     }
@@ -95,6 +100,7 @@ async fn main() {
         security: sec,
         sweet_client,
         sweet_plugins,
+        neighbors,
     });
 
     let app = axum::Router::new().fallback({

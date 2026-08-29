@@ -25,6 +25,26 @@ use axum::response::Response;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// The shell, with the neighborhood seed injected the way the node server
+/// interpolates seedNeighbors into static.html (--neighbors flag).
+fn index_html(site: &Site, dist: &Path) -> Response {
+    let Ok(mut html) = std::fs::read_to_string(dist.join("index.html")) else {
+        return not_found("Not found");
+    };
+    if let Some(seed) = site.neighbors.as_deref() {
+        let tag = format!(
+            "<script>window.seedNeighbors = '{}';</script></head>",
+            seed.replace('\\', "").replace('\'', "")
+        );
+        html = html.replacen("</head>", &tag, 1);
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap()
+}
+
 fn file(path: &Path, mime: &str, cors: bool) -> Option<Response> {
     let bytes = std::fs::read(path).ok()?;
     let mut b = Response::builder()
@@ -66,7 +86,7 @@ pub fn route(
     match (method, path) {
         ("GET" | "HEAD", "/") => {
             if query.contains("docs=") || query.contains("doc=") {
-                file(&dist.join("index.html"), "text/html; charset=utf-8", false)
+                Some(index_html(site, dist))
             } else {
                 Some(redirect(format!("/?docs={}@{}", site.home, auth.host)))
             }

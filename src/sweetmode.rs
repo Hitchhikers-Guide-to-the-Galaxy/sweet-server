@@ -143,12 +143,25 @@ pub fn route(
                 .unwrap_or_else(|| not_found("Not found")),
             )
         }
-        ("GET", "/api/me") => Some(match site.security.owner_name() {
-            Some(name) if auth.authorized => {
-                json_status(StatusCode::OK, json!({"user": name, "name": name}))
-            }
-            _ => json_status(StatusCode::UNAUTHORIZED, json!({})),
-        }),
+        // the shell globals the reference injects (isClaimed, isAuthenticated,
+        // isOwner, ownerName), as data — the client's padlock needs all four
+        // to tell "claimed but signed out" from "never claimed"
+        ("GET", "/api/me") => {
+            let owner = site.security.owner_name();
+            let is_owner = auth.authorized;
+            Some(json_status(
+                StatusCode::OK,
+                json!({
+                    "owned": owner.is_some(),
+                    "ownerName": owner,
+                    "authenticated": auth.user,
+                    "isOwner": is_owner,
+                    // back-compat with the first cut of this route
+                    "user": if is_owner { owner.clone() } else { None },
+                    "name": if is_owner { owner } else { None },
+                }),
+            ))
+        }
         ("POST", "/api/wiki-save") => {
             let req: Value = serde_json::from_slice(body).ok()?;
             let slug = req["slug"].as_str().unwrap_or_default().to_string();

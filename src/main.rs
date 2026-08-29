@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 mod actions;
 mod assets;
+mod plugmatic;
 mod search;
 mod security;
 
@@ -131,6 +132,34 @@ async fn main() {
                             return must_be_owner();
                         }
                         assets::delete(&assets_root, &query)
+                    }
+                    // plugmatic plugin routes (native port — Browse All Plugins)
+                    ("GET" | "HEAD", "/plugin/plugmatic/plugins") => {
+                        plugmatic::plugins(&plugin_packages(&site))
+                    }
+                    ("GET" | "HEAD", "/plugin/plugmatic/sitemap.json") => {
+                        plugmatic::sitemap(&plugin_packages(&site))
+                    }
+                    ("GET" | "HEAD", p)
+                        if p.starts_with("/plugin/plugmatic/page/") && p.ends_with(".json") =>
+                    {
+                        let slug = &p["/plugin/plugmatic/page/".len()..p.len() - 5];
+                        plugmatic::page_by_slug(&plugin_packages(&site), slug)
+                    }
+                    ("GET" | "HEAD", p) if p.starts_with("/plugin/plugmatic/file/") => {
+                        let rest = &p["/plugin/plugmatic/file/".len()..];
+                        match rest.split_once("/slug/") {
+                            Some((file, slug)) if site.vendor.is_some() => {
+                                plugmatic::file_slug(site.vendor.as_ref().unwrap(), file, slug)
+                            }
+                            _ => not_found("Page not found"),
+                        }
+                    }
+                    ("POST", "/plugin/plugmatic/plugins") => {
+                        plugmatic::plugins_post(&plugin_packages(&site), &body)
+                    }
+                    ("POST", "/plugin/plugmatic/install" | "/plugin/plugmatic/restart") => {
+                        plugmatic::admin_403()
                     }
                     ("GET" | "HEAD", _) => {
                         let auth = Auth {

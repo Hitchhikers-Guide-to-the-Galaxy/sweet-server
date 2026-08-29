@@ -46,6 +46,60 @@ struct Site {
     neighbors: Option<String>,
 }
 
+/// Farm mode (--farm <root>): the Host header picks an EXISTING site dir
+/// under root — the test framework for real wikis in place, no copies, no
+/// ports. A "sweet-" prefix on the first host label is stripped, so behind
+/// a wildcard proxy sweet-pi.pi5.private.fish serves root/pi.pi5.private.fish.
+/// Farm sites run Default (read-only) security: the node farm keeps sole
+/// write ownership of its data dirs.
+struct Farm {
+    root: PathBuf,
+    prefix: String,
+    defaults: Option<PathBuf>,
+    vendor: Option<PathBuf>,
+    sweet_client: Option<PathBuf>,
+    sweet_plugins: Option<PathBuf>,
+    neighbors: Option<String>,
+    cache: std::sync::RwLock<std::collections::HashMap<String, Arc<Site>>>,
+}
+
+impl Farm {
+    fn site_for(&self, host: &str) -> Option<Arc<Site>> {
+        let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+        let name = match host.split_once('.') {
+            Some((first, rest)) if first.starts_with(self.prefix.as_str()) => {
+                format!("{}.{}", &first[self.prefix.len()..], rest)
+            }
+            _ => host.clone(),
+        };
+        if let Some(s) = self.cache.read().unwrap().get(&name) {
+            return Some(s.clone());
+        }
+        let data = self.root.join(&name);
+        if name.contains("..") || name.contains('/') || !data.join("pages").is_dir() {
+            return None;
+        }
+        let sec = security::Security::new(security::Mode::Default, &data.join("status/owner.json"));
+        let site = Arc::new(Site {
+            data,
+            defaults: self.defaults.clone(),
+            vendor: self.vendor.clone(),
+            home: "welcome-visitors".into(),
+            security: sec,
+            sweet_client: self.sweet_client.clone(),
+            sweet_plugins: self.sweet_plugins.clone(),
+            neighbors: self.neighbors.clone(),
+        });
+        self.cache.write().unwrap().insert(name, site.clone());
+        Some(site)
+    }
+}
+
+enum Serving {
+    Single(Arc<Site>),
+    Farm(Arc<Farm>),
+}
+
 #[tokio::main]
 async fn main() {
     let mut data: Option<PathBuf> = None;
@@ -58,6 +112,8 @@ async fn main() {
     let mut sweet_client: Option<PathBuf> = None;
     let mut sweet_plugins: Option<PathBuf> = None;
     let mut neighbors: Option<String> = None;
+    let mut farm: Option<PathBuf> = None;
+    let mut farm_prefix = "sweet-".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -76,37 +132,57 @@ async fn main() {
             "--sweet-client" => sweet_client = args.next().map(PathBuf::from),
             "--sweet-plugins" => sweet_plugins = args.next().map(PathBuf::from),
             "--neighbors" => neighbors = args.next(),
+            "--farm" => farm = args.next().map(PathBuf::from),
+            "--farm-prefix" => {
+                if let Some(p) = args.next() {
+                    farm_prefix = p;
+                }
+            }
             _ => {}
         }
     }
-    let data = data.expect("--data <site-dir> is required");
-    // mode selection mirrors the reference CLI: --security_type wins,
-    // --security_legacy softens the default stub, else read-only (spec §6.2)
-    let mode = match security_type.as_deref() {
-        Some(t) if t.contains("friends") => security::Mode::Friends,
-        Some(other) => panic!("unsupported security_type {other:?} (only friends)"),
-        None if security_legacy => security::Mode::Legacy,
-        None => security::Mode::Default,
+    let serving = if let Some(root) = farm {
+        Serving::Farm(Arc::new(Farm {
+            root,
+            prefix: farm_prefix,
+            defaults,
+            vendor,
+            sweet_client,
+            sweet_plugins,
+            neighbors,
+            cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }))
+    } else {
+        let data = data.expect("--data <site-dir> is required (or --farm <root>)");
+        // mode selection mirrors the reference CLI: --security_type wins,
+        // --security_legacy softens the default stub, else read-only (spec §6.2)
+        let mode = match security_type.as_deref() {
+            Some(t) if t.contains("friends") => security::Mode::Friends,
+            Some(other) => panic!("unsupported security_type {other:?} (only friends)"),
+            None if security_legacy => security::Mode::Legacy,
+            None => security::Mode::Default,
+        };
+        // multer's dest option creates assets/uploads at plugin startup — the
+        // assets list route then answers {error:null, files:[]} on a fresh site
+        let _ = std::fs::create_dir_all(data.join("assets/uploads"));
+        let sec = security::Security::new(mode, &data.join("status/owner.json"));
+        Serving::Single(Arc::new(Site {
+            data,
+            defaults,
+            vendor,
+            home: "welcome-visitors".into(),
+            security: sec,
+            sweet_client,
+            sweet_plugins,
+            neighbors,
+        }))
     };
-    // multer's dest option creates assets/uploads at plugin startup — the
-    // assets list route then answers {error:null, files:[]} on a fresh site
-    let _ = std::fs::create_dir_all(data.join("assets/uploads"));
-    let sec = security::Security::new(mode, &data.join("status/owner.json"));
-    let site = Arc::new(Site {
-        data,
-        defaults,
-        vendor,
-        home: "welcome-visitors".into(),
-        security: sec,
-        sweet_client,
-        sweet_plugins,
-        neighbors,
-    });
+    let serving = Arc::new(serving);
 
     let app = axum::Router::new().fallback({
-        let site = site.clone();
+        let serving = serving.clone();
         move |req: Request<Body>| {
-            let site = site.clone();
+            let serving = serving.clone();
             async move {
                 let method = req.method().clone();
                 let path = req.uri().path().to_string();
@@ -121,6 +197,18 @@ async fn main() {
                 let content_type = header_str(&req, header::CONTENT_TYPE);
                 let req_host = header_str(&req, header::HOST)
                     .unwrap_or_else(|| "localhost".into());
+                let site = match serving.as_ref() {
+                    Serving::Single(site) => site.clone(),
+                    Serving::Farm(farm) => match farm.site_for(&req_host) {
+                        Some(site) => site,
+                        None => {
+                            return Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Body::from("Unknown wiki"))
+                                .unwrap()
+                        }
+                    },
+                };
                 let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
                     .await
                     .unwrap_or_default();
@@ -201,7 +289,10 @@ async fn main() {
 
     let addr = SocketAddr::from((host, port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    eprintln!("sweet-server (read-only) on http://{addr} serving {:?}", site.data);
+    match serving.as_ref() {
+        Serving::Single(site) => eprintln!("sweet-server on http://{addr} serving {:?}", site.data),
+        Serving::Farm(farm) => eprintln!("sweet-server FARM on http://{addr} over {:?} (prefix {:?}, read-only)", farm.root, farm.prefix),
+    }
     axum::serve(listener, app).await.unwrap();
 }
 

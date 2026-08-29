@@ -88,7 +88,7 @@ pub fn route(
             if query.contains("docs=") || query.contains("doc=") {
                 Some(index_html(site, dist))
             } else {
-                Some(redirect(format!("/?docs={}@{}", site.home, auth.host)))
+                Some(redirect(format!("/view/{}", site.home)))
             }
         }
         ("GET" | "HEAD", p) if p.starts_with("/app/") => {
@@ -176,27 +176,15 @@ pub fn route(
                 }
             })
         }
-        // fedwiki-shaped links keep working: translate lineups into ?docs=
-        ("GET" | "HEAD", p) if p.starts_with("/view/") => {
-            let segs: Vec<&str> = p.trim_matches('/').split('/').collect();
-            let mut cols = Vec::new();
-            for pair in segs.chunks(2) {
-                if pair.len() == 2 {
-                    let target = if pair[0] == "view" {
-                        format!("{}@{}", pair[1], auth.host)
-                    } else {
-                        format!("{}@{}", pair[1], pair[0])
-                    };
-                    cols.push(target);
-                }
-            }
-            Some(redirect(format!("/?docs={}", cols.join(","))))
-        }
+        // the URL model: fedwiki-shaped lineup paths ARE the client's URLs
+        // now — serve the shell and let it parse the pairs (Miller
+        // colsFromPath); ?docs= remains as the mixed-lineup fallback
+        ("GET" | "HEAD", p) if p.starts_with("/view/") => Some(index_html(site, dist)),
         ("GET" | "HEAD", p)
             if p.ends_with(".html") && !p[1..].contains('/') && p != "/index.html" =>
         {
             let slug = &p[1..p.len() - 5];
-            Some(redirect(format!("/?docs={}@{}", slug, auth.host)))
+            Some(redirect(format!("/view/{slug}")))
         }
         _ => None,
     }

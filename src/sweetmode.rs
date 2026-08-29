@@ -86,10 +86,28 @@ pub fn route(
             if rel.contains("..") {
                 return Some(not_found("Not found"));
             }
-            let dir = site.sweet_plugins.as_ref()?;
+            // sweet plugin modules first; fall back to the vendor tree's
+            // classic bundles (wiki-plugin-<type>/client/<file>) so the
+            // sweet-compat classic path still reaches every site plugin
+            if let Some(resp) = site
+                .sweet_plugins
+                .as_ref()
+                .and_then(|dir| file(&dir.join(rel), guess_mime(p), true))
+            {
+                return Some(resp);
+            }
+            let (plugin, tail) = rel.split_once('/')?;
+            let vendor = site.vendor.as_ref()?;
             Some(
-                file(&dir.join(rel), guess_mime(p), true)
-                    .unwrap_or_else(|| not_found("Not found")),
+                file(
+                    &vendor
+                        .join(format!("wiki-plugin-{plugin}"))
+                        .join("client")
+                        .join(tail),
+                    guess_mime(p),
+                    true,
+                )
+                .unwrap_or_else(|| not_found("Not found")),
             )
         }
         ("GET", "/api/me") => Some(match site.security.owner_name() {

@@ -139,12 +139,17 @@ pub fn route(
         ("POST", "/api/wiki-save") => {
             let req: Value = serde_json::from_slice(body).ok()?;
             let slug = req["slug"].as_str().unwrap_or_default().to_string();
-            if slug.is_empty()
-                || !slug
+            let slug_ok = !slug.is_empty()
+                && slug
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-                || !site.data.join("pages").join(&slug).is_file()
-            {
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            // a create action may target a page that does not exist yet —
+            // that is what creating means (Neighborhood Plan Phase 3, the
+            // future column's create offer); every other action still needs
+            // an existing page
+            let exists = slug_ok && site.data.join("pages").join(&slug).is_file();
+            let creating = req["action"]["type"].as_str() == Some("create");
+            if !slug_ok || (!exists && !creating) {
                 // sweet-docs server.mjs's exact refusal for foreign pages
                 return Some(json_status(
                     StatusCode::NOT_FOUND,

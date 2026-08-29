@@ -28,6 +28,7 @@ mod assets;
 mod plugmatic;
 mod search;
 mod security;
+mod sweetmode;
 
 struct Site {
     data: PathBuf,
@@ -37,6 +38,9 @@ struct Site {
     vendor: Option<PathBuf>,
     home: String,
     security: security::Security,
+    /// sweet-client mode: serve the Sweet Client build as this site's shell
+    sweet_client: Option<PathBuf>,
+    sweet_plugins: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -48,6 +52,8 @@ async fn main() {
     let mut host: std::net::IpAddr = [127, 0, 0, 1].into();
     let mut security_type: Option<String> = None;
     let mut security_legacy = false;
+    let mut sweet_client: Option<PathBuf> = None;
+    let mut sweet_plugins: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -63,6 +69,8 @@ async fn main() {
             }
             "--security_type" => security_type = args.next(),
             "--security_legacy" => security_legacy = true,
+            "--sweet-client" => sweet_client = args.next().map(PathBuf::from),
+            "--sweet-plugins" => sweet_plugins = args.next().map(PathBuf::from),
             _ => {}
         }
     }
@@ -85,6 +93,8 @@ async fn main() {
         vendor,
         home: "welcome-visitors".into(),
         security: sec,
+        sweet_client,
+        sweet_plugins,
     });
 
     let app = axum::Router::new().fallback({
@@ -110,6 +120,18 @@ async fn main() {
                     .unwrap_or_default();
                 let authorized = site.security.is_authorized(cookie.as_deref());
                 let assets_root = site.data.join("assets");
+                let auth = Auth {
+                    authorized,
+                    user: site.security.user(cookie.as_deref()),
+                    host: req_host.clone(),
+                };
+                // sweet-client mode answers shell/app/api paths first; the
+                // wiki API below keeps serving either way
+                if let Some(resp) =
+                    sweetmode::route(&site, method.as_str(), &path, &query, &body, &auth)
+                {
+                    return resp;
+                }
                 match (method.as_str(), path.as_str()) {
                     // friends security routes (spec §6.3)
                     ("POST", "/login") => {
@@ -161,14 +183,7 @@ async fn main() {
                     ("POST", "/plugin/plugmatic/install" | "/plugin/plugmatic/restart") => {
                         plugmatic::admin_403()
                     }
-                    ("GET" | "HEAD", _) => {
-                        let auth = Auth {
-                            authorized,
-                            user: site.security.user(cookie.as_deref()),
-                            host: req_host,
-                        };
-                        route(&site, &path, auth)
-                    }
+                    ("GET" | "HEAD", _) => route(&site, &path, auth),
                     ("PUT" | "DELETE", _) => {
                         write_route(&site, method.as_str(), &path, &body, authorized)
                     }
@@ -922,6 +937,8 @@ fn guess_mime(path: &str) -> &'static str {
         Some("html") => "text/html",
         Some("svg") => "image/svg+xml",
         Some("mp3") => "audio/mpeg",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
         _ => "application/octet-stream",
     }
 }

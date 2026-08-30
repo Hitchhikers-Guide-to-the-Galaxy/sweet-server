@@ -265,12 +265,32 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <style>:root{color-scheme:light dark}
 body{font:14px/1.6 system-ui,sans-serif;margin:1.2rem}</style></head><body>
 <p><b>Sweet Toggle</b> — flipping wiki routing needs a Keycloak sign-in.</p>
-<p><a id="go" target="_top" href="/auth/login">Sign in with Keycloak</a></p>
+<p id="msg"></p>
 <script>
-// come back to the wiki page this panel is embedded in
+// The wiki frame plugin sandboxes this iframe with no allow-top-navigation
+// and no allow-popups, so a link in here CANNOT reach Keycloak. Framed:
+// point at the sign-in link beside the panel and poll until the session
+// appears (set by a top-level login), then swap in the real panel.
+// Standalone tab: a plain working link.
 const back = document.referrer || location.href;
-document.getElementById("go").href =
-  "/auth/login?next=" + encodeURIComponent(back);
+const login = "/auth/login?next=" + encodeURIComponent(back);
+const msg = document.getElementById("msg");
+let framed = true;
+try { framed = window.top !== window.self; } catch (e) {}
+if (!framed) {
+  msg.innerHTML = "<a href='" + login + "'>Sign in with Keycloak</a>";
+} else {
+  msg.innerHTML = "Use the <b>Sign in</b> link on the wiki page beside "
+    + "this panel (the frame sandbox blocks dialogs from in here). "
+    + "This panel takes over by itself once you are signed in.";
+  setInterval(async () => {
+    try {
+      const r = await fetch("/api/status", {credentials: "include",
+                                            cache: "no-store"});
+      if (r.ok) location.reload();
+    } catch (e) {}
+  }, 3000);
+}
 </script></body></html>
 """
 
@@ -304,7 +324,7 @@ UI = """<!DOCTYPE html>
 <div class="note">Toggle a wiki between the <b>node server</b> and the
 <b>Sweet Server</b> (Rust, classic client, read-only while toggled — flip
 back to edit). Links open the live site through its normal door.
-Signed in as <b id="who"></b> · <a href="/auth/logout" target="_top">sign out</a></div>
+Signed in as <b id="who"></b> · <a href="#" id="signout">sign out</a></div>
 <input id="filter" type="search" placeholder="filter sites…"
   style="font: inherit; padding: 0.2em 0.6em; margin-bottom: 0.4rem;
          border-radius: 6px; border: 1px solid rgba(128,128,128,0.5);
@@ -313,6 +333,16 @@ Signed in as <b id="who"></b> · <a href="/auth/logout" target="_top">sign out</
 <script>
 const APIS = __APIS__;
 document.getElementById("who").textContent = __USER__;
+let framed = true;
+try { framed = window.top !== window.self; } catch (e) {}
+// target=_top is dead inside the sandboxed wiki frame — sign out of every
+// host with credentialed fetches instead, then reload in place
+document.getElementById("signout").addEventListener("click", async e => {
+  e.preventDefault();
+  await Promise.all(APIS.map(api =>
+    fetch(api + "/auth/logout", {credentials: "include"}).catch(() => {})));
+  location.reload();
+});
 const hostsDiv = document.getElementById("hosts");
 
 // stable section order + visible loading state, whatever answers first
@@ -347,11 +377,20 @@ function render(api, data, err) {
     hostsDiv.appendChild(sec);
   }
   if (err === "401") {
-    // Keycloak SSO usually completes this without a prompt
-    sec.innerHTML = "<h2>" + api + "</h2><div class='note'>"
-      + "not signed in on this host — <a target='_top' href='" + api
-      + "/auth/login?next=" + encodeURIComponent(document.referrer
-        || location.href) + "'>sign in</a></div>";
+    const name = api.replace(/^https:\\/\\/toggle\\./, "")
+      .replace(/\\.private\\.fish\\/?$/, "");
+    // Keycloak SSO completes this without a prompt; inside the sandboxed
+    // frame no link can navigate, so lean on the page's Sign in link and
+    // the periodic refresh
+    sec.innerHTML = "<h2>" + name + "</h2><div class='note'>"
+      + (framed
+        ? "not signed in on " + name + " — use the Sign in link on the "
+          + "wiki page (it covers both hosts); this section fills in on "
+          + "the next refresh"
+        : "not signed in on " + name + " — <a href='" + api
+          + "/auth/login?next=" + encodeURIComponent(location.href)
+          + "'>sign in</a>")
+      + "</div>";
     return;
   }
   if (err) {

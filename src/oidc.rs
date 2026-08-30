@@ -47,6 +47,15 @@ pub struct Cfg {
     pub use_https: bool,
     /// admin identity: the configured admin.oauth2 value (spec §authz)
     admin_id: Option<String>,
+    /// signs the session cookie. With the SAME secret across processes
+    /// and restarts a session survives both — node's client-sessions
+    /// semantics, and what makes farm-wide sign-in possible. Absent ->
+    /// a random per-boot secret (sessions die with the process; warned).
+    cookie_secret: String,
+    /// optional cookie Domain (the node farm's wiki_domain): scope the
+    /// session cookie to a parent domain so one sign-in covers every
+    /// site the farm serves under it
+    wiki_domain: Option<String>,
 }
 
 struct Pending {
@@ -86,6 +95,19 @@ impl Oidc {
                     .into(),
                 use_https: cfg["security_useHttps"].as_bool().unwrap_or(false),
                 admin_id: cfg["admin"]["oauth2"].as_str().map(String::from),
+                cookie_secret: match cfg["cookieSecret"].as_str() {
+                    Some(s) => s.to_string(),
+                    None => {
+                        eprintln!(
+                            "oidc: no cookieSecret in {path:?} — sessions \
+                             will not survive a restart"
+                        );
+                        let mut buf = [0u8; 32];
+                        getrandom::getrandom(&mut buf).expect("os randomness");
+                        buf.iter().map(|b| format!("{b:02x}")).collect()
+                    }
+                },
+                wiki_domain: cfg["wiki_domain"].as_str().map(String::from),
             },
             meta: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
@@ -144,6 +166,94 @@ impl Oidc {
 
 fn redirect_uri(auth: &Auth) -> String {
     format!("{}://{}/auth/oauth2/callback/oauth2", auth.proto, auth.host)
+}
+
+// ---------------------------------------------- stateless signed sessions
+//
+// cookie value = base64url(identity JSON incl. exp) . hex(HMAC-SHA256).
+// No server state: a session survives restarts and is valid on every
+// site a farm serves (per-site AUTHORISATION still applies — the cookie
+// only says who you are, owner.json says what you may touch).
+
+const SESSION_TTL_SECS: u64 = 7 * 86400;
+
+fn hmac_hex(secret: &str, payload: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        .expect("hmac accepts any key length");
+    mac.update(payload.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn b64(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Set-Cookie value carrying the signed identity.
+pub fn session_cookie(oidc: &Oidc, identity: &Value) -> String {
+    let mut payload = identity.clone();
+    payload["exp"] = Value::from(now_secs() + SESSION_TTL_SECS);
+    let body = b64(payload.to_string().as_bytes());
+    let sig = hmac_hex(&oidc.cfg.cookie_secret, &body);
+    let domain = oidc
+        .cfg
+        .wiki_domain
+        .as_deref()
+        .map(|d| format!("; Domain={d}"))
+        .unwrap_or_default();
+    format!(
+        "{}={body}.{sig}; Path=/; Max-Age={SESSION_TTL_SECS}; HttpOnly; SameSite=Lax{}{domain}",
+        crate::security::OAUTH2_COOKIE,
+        if oidc.cfg.use_https { "; Secure" } else { "" },
+    )
+}
+
+/// Verify and decode the request's session cookie into the mapped
+/// identity {id, username, name}; None on absence, bad signature or expiry.
+pub fn decode_session(oidc: &Oidc, cookie_header: Option<&str>) -> Option<Value> {
+    let raw = cookie_header?.split(';').find_map(|part| {
+        let (k, v) = part.trim().split_once('=')?;
+        (k == crate::security::OAUTH2_COOKIE && !v.is_empty()).then(|| v.to_string())
+    })?;
+    let (body, sig) = raw.rsplit_once('.')?;
+    if hmac_hex(&oidc.cfg.cookie_secret, body) != sig {
+        return None;
+    }
+    let identity: Value = serde_json::from_slice(&b64_decode(body)?).ok()?;
+    if identity["exp"].as_u64()? < now_secs() {
+        return None;
+    }
+    Some(identity)
+}
+
+fn clearing_cookie(oidc: &Oidc) -> String {
+    let domain = oidc
+        .cfg
+        .wiki_domain
+        .as_deref()
+        .map(|d| format!("; Domain={d}"))
+        .unwrap_or_default();
+    format!(
+        "{}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{domain}",
+        crate::security::OAUTH2_COOKIE
+    )
 }
 
 // ---------------------------------------------------------------- routes
@@ -245,18 +355,18 @@ pub fn callback(oidc: &Oidc, site: &Site, auth: &Auth, query: &str) -> Response 
         "username": field(&oidc.cfg.username_field, "preferred_username"),
         "name": field(&oidc.cfg.display_field, "preferred_username"),
     });
-    let cookie = site.security.oauth2_grant(&identity, oidc.cfg.use_https);
+    let _ = site; // per-site state no longer holds sessions
     Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, pending.callback)
-        .header(header::SET_COOKIE, cookie)
+        .header(header::SET_COOKIE, session_cookie(oidc, &identity))
         .body(Body::empty())
         .unwrap()
 }
 
 /// POST /auth/sign-out — better-auth's CSRF stance, observed on the
 /// oracle: no Origin header -> 403 MISSING_OR_NULL_ORIGIN.
-pub fn sign_out(site: &Site, auth: &Auth) -> Response {
+pub fn sign_out(oidc: &Oidc, auth: &Auth) -> Response {
     match &auth.origin {
         None => Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -275,15 +385,12 @@ pub fn sign_out(site: &Site, auth: &Auth) -> Response {
                     .to_string(),
             ))
             .unwrap(),
-        Some(_) => {
-            let cookie = site.security.oauth2_signout(auth.cookie.as_deref());
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-                .header(header::SET_COOKIE, cookie)
-                .body(Body::from(json!({"success": true}).to_string()))
-                .unwrap()
-        }
+        Some(_) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .header(header::SET_COOKIE, clearing_cookie(oidc))
+            .body(Body::from(json!({"success": true}).to_string()))
+            .unwrap(),
     }
 }
 
@@ -296,12 +403,12 @@ pub fn client_settings(oidc: &Oidc, site: &Site, auth: &Auth) -> Response {
 /// GET /auth/claim-wiki (social.js): signed-in user claims an ownerless
 /// site; owner present -> express sendStatus(403) "Forbidden".
 pub fn claim_wiki(site: &Site, auth: &Auth) -> Response {
-    let Some(identity) = site.security.oauth2_session(auth.cookie.as_deref()) else {
+    let Some(identity) = auth.oauth2_identity.as_ref() else {
         return plain(403, "Forbidden");
     };
     match site
         .security
-        .oauth2_claim(&site.data.join("status/owner.json"), &identity)
+        .oauth2_claim(&site.data.join("status/owner.json"), identity)
     {
         Ok(name) => crate::cors_json(json!({"ownerName": name})),
         Err(403) => plain(403, "Forbidden"),
@@ -310,11 +417,10 @@ pub fn claim_wiki(site: &Site, auth: &Auth) -> Response {
 }
 
 /// GET /logout (social.js): req.session.reset() -> "OK".
-pub fn logout(site: &Site, auth: &Auth) -> Response {
-    let cookie = site.security.oauth2_signout(auth.cookie.as_deref());
+pub fn logout(oidc: &Oidc) -> Response {
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::SET_COOKIE, cookie)
+        .header(header::SET_COOKIE, clearing_cookie(oidc))
         .body(Body::from("OK"))
         .unwrap()
 }

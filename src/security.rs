@@ -105,12 +105,10 @@ impl Security {
 
     /// getUser — friends returns `true` when a session friend exists
     /// (friends.coffee:82-86), the stub always '' (security.js:68-70).
+    /// (OAuth2 identity is decoded from the signed cookie in main.rs —
+    /// oidc::decode_session — not through this seam.)
     pub fn user(&self, cookie_header: Option<&str>) -> bool {
-        match self.mode {
-            Mode::Friends => self.session_friend(cookie_header).is_some(),
-            Mode::OAuth2 => self.oauth2_session(cookie_header).is_some(),
-            _ => false,
-        }
+        matches!(self.mode, Mode::Friends) && self.session_friend(cookie_header).is_some()
     }
 
     /// isAuthorized — gates every write and the recycler reads.
@@ -123,49 +121,30 @@ impl Security {
                 (Some(friend), Some(secret)) => friend == secret,
                 _ => false,
             },
-            // social.js isAuthorized: unclaimed -> open for everyone;
-            // claimed -> the session identity must match owner.oauth2.id
-            // (string compare on both sides, like the oracle's toString())
-            Mode::OAuth2 => {
-                let owner = self.owner.lock().unwrap().clone();
-                match owner {
-                    None => true,
-                    Some(o) => match self.oauth2_session(cookie_header) {
-                        Some(u) => {
-                            let oid = json_as_string(&o["oauth2"]["id"]);
-                            !oid.is_empty() && oid == json_as_string(&u["id"])
-                        }
-                        None => false,
-                    },
-                }
-            }
+            // oauth2 authorisation goes through oauth2_is_authorized with
+            // the identity main.rs decoded from the signed cookie
+            Mode::OAuth2 => false,
         }
     }
 
     // ------------------------------------------------------- oauth2 mode
 
-    /// The mapped identity {id, username, name} for the request's
-    /// fedwiki.session_token cookie, if a session exists.
-    pub fn oauth2_session(&self, cookie_header: Option<&str>) -> Option<serde_json::Value> {
-        if !matches!(self.mode, Mode::OAuth2) {
-            return None;
+    /// social.js isAuthorized with a pre-decoded identity: unclaimed ->
+    /// open for everyone; claimed -> the identity must match
+    /// owner.oauth2.id (string compare both sides, the oracle's
+    /// toString()).
+    pub fn oauth2_is_authorized(&self, identity: Option<&serde_json::Value>) -> bool {
+        let owner = self.owner.lock().unwrap().clone();
+        match owner {
+            None => true,
+            Some(o) => match identity {
+                Some(u) => {
+                    let oid = json_as_string(&o["oauth2"]["id"]);
+                    !oid.is_empty() && oid == json_as_string(&u["id"])
+                }
+                None => false,
+            },
         }
-        let token = Self::cookie_value(cookie_header, OAUTH2_COOKIE)?;
-        let stored = self.sessions.lock().unwrap().get(&token).cloned()?;
-        serde_json::from_str(&stored).ok()
-    }
-
-    /// Store a mapped identity; returns the Set-Cookie header value.
-    pub fn oauth2_grant(&self, identity: &serde_json::Value, secure: bool) -> String {
-        let token = rand_hex(24);
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(token.clone(), identity.to_string());
-        format!(
-            "{OAUTH2_COOKIE}={token}; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax{}",
-            if secure { "; Secure" } else { "" }
-        )
     }
 
     /// GET /auth/claim-wiki (social.js): owner absent -> write owner.json
@@ -201,13 +180,6 @@ impl Security {
         Ok(name)
     }
 
-    /// Drop the request's oauth2 session; returns the clearing Set-Cookie.
-    pub fn oauth2_signout(&self, cookie_header: Option<&str>) -> String {
-        if let Some(token) = Self::cookie_value(cookie_header, OAUTH2_COOKIE) {
-            self.sessions.lock().unwrap().remove(&token);
-        }
-        format!("{OAUTH2_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
-    }
 
     fn grant_session(&self, secret: &str) -> String {
         let token = rand_hex(24);

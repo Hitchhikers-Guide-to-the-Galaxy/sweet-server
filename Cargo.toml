@@ -15,6 +15,9 @@ futures-util = { version = "0.3", default-features = false }
 bytes = "1"
 getrandom = "0.2"
 openidconnect = "4"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.21"
 
 [profile.release]
 strip = true

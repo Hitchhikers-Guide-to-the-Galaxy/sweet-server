@@ -60,8 +60,9 @@ struct Site {
 /// under root — the test framework for real wikis in place, no copies, no
 /// ports. A "sweet-" prefix on the first host label is stripped, so behind
 /// a wildcard proxy sweet-pi.pi5.private.fish serves root/pi.pi5.private.fish.
-/// Farm sites run Default (read-only) security: the node farm keeps sole
-/// write ownership of its data dirs.
+/// Default farm security is read-only (the node farm keeps sole write
+/// ownership — the shadow-farm stance); `--farm-security oauth2` turns on
+/// Keycloak sign-in with per-site owner gating instead (Phase 4).
 struct Farm {
     root: PathBuf,
     prefix: String,
@@ -71,6 +72,11 @@ struct Farm {
     sweet_plugins: Option<PathBuf>,
     neighbors: Option<String>,
     tint: Option<String>,
+    /// --farm-security oauth2: farmed sites run Mode::OAuth2 with
+    /// per-site owner.json gating instead of the read-only Default —
+    /// Keycloak Plan Phase 4. One Oidc (and one signed-cookie secret)
+    /// serves the whole farm; authorisation stays per-site.
+    oidc: Option<Arc<oidc::Oidc>>,
     cache: std::sync::RwLock<std::collections::HashMap<String, Arc<Site>>>,
 }
 
@@ -97,7 +103,12 @@ impl Farm {
         if name.contains("..") || name.contains('/') || !data.join("pages").is_dir() {
             return None;
         }
-        let sec = security::Security::new(security::Mode::Default, &data.join("status/owner.json"));
+        let mode = if self.oidc.is_some() {
+            security::Mode::OAuth2
+        } else {
+            security::Mode::Default
+        };
+        let sec = security::Security::new(mode, &data.join("status/owner.json"));
         let site = Arc::new(Site {
             data,
             defaults: self.defaults.clone(),
@@ -109,7 +120,7 @@ impl Farm {
             neighbors: self.neighbors.clone(),
             index_cache: Default::default(),
             tint: self.tint.clone(),
-            oidc: None, // farm mode stays read-only until Phase 4
+            oidc: self.oidc.clone(),
         });
         self.cache.write().unwrap().insert(name, site.clone());
         Some(site)
@@ -136,6 +147,7 @@ async fn main() {
     let mut farm: Option<PathBuf> = None;
     let mut tint: Option<String> = None;
     let mut oidc_config: Option<PathBuf> = None;
+    let mut farm_security: Option<String> = None;
     let mut farm_prefix = "sweet-".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -158,6 +170,7 @@ async fn main() {
             "--farm" => farm = args.next().map(PathBuf::from),
             "--tint" => tint = args.next(),
             "--oidc-config" => oidc_config = args.next().map(PathBuf::from),
+            "--farm-security" => farm_security = args.next(),
             "--farm-prefix" => {
                 if let Some(p) = args.next() {
                     farm_prefix = p;
@@ -167,6 +180,19 @@ async fn main() {
         }
     }
     let serving = if let Some(root) = farm {
+        let farm_oidc = match farm_security.as_deref() {
+            Some("oauth2") | Some("social") => {
+                let path = oidc_config.clone().expect(
+                    "--farm-security oauth2 requires --oidc-config <wiki-config.json>",
+                );
+                match oidc::Oidc::from_config_file(&path) {
+                    Ok(o) => Some(Arc::new(o)),
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            Some(other) => panic!("unsupported --farm-security {other:?} (oauth2)"),
+            None => None, // read-only Default — the shadow-farm behaviour
+        };
         Serving::Farm(Arc::new(Farm {
             root,
             prefix: farm_prefix,
@@ -176,6 +202,7 @@ async fn main() {
             sweet_plugins,
             neighbors,
             tint,
+            oidc: farm_oidc,
             cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         }))
     } else {
@@ -269,15 +296,29 @@ async fn main() {
                 let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
                     .await
                     .unwrap_or_default();
-                let authorized = site.security.is_authorized(cookie.as_deref());
+                // oauth2: one signed-cookie decode per request; the
+                // identity is farm-wide, authorisation stays per-site
+                let oauth2_identity = site
+                    .oidc
+                    .as_ref()
+                    .and_then(|o| oidc::decode_session(o, cookie.as_deref()));
+                let authorized = if site.oidc.is_some() {
+                    site.security.oauth2_is_authorized(oauth2_identity.as_ref())
+                } else {
+                    site.security.is_authorized(cookie.as_deref())
+                };
                 let assets_root = site.data.join("assets");
                 let auth = Auth {
                     authorized,
-                    user: site.security.user(cookie.as_deref()),
+                    user: if site.oidc.is_some() {
+                        oauth2_identity.is_some()
+                    } else {
+                        site.security.user(cookie.as_deref())
+                    },
                     host: req_host.clone(),
                     proto,
-                    cookie: cookie.clone(),
                     origin,
+                    oauth2_identity,
                 };
                 // sweet-client mode answers shell/app/api paths first; the
                 // wiki API below keeps serving either way
@@ -297,7 +338,7 @@ async fn main() {
                         oidc::callback(site.oidc.as_ref().unwrap(), &site, &auth, &query)
                     }
                     ("POST", "/auth/sign-out") if site.oidc.is_some() => {
-                        oidc::sign_out(&site, &auth)
+                        oidc::sign_out(site.oidc.as_ref().unwrap(), &auth)
                     }
                     ("GET" | "HEAD", "/auth/client-settings.json")
                         if site.oidc.is_some() =>
@@ -314,13 +355,12 @@ async fn main() {
                         oidc::claim_wiki(&site, &auth)
                     }
                     ("GET" | "HEAD", "/logout") if site.oidc.is_some() => {
-                        oidc::logout(&site, &auth)
+                        oidc::logout(site.oidc.as_ref().unwrap())
                     }
                     // admin-gated version answer (social.js isAdmin ->
                     // admin middleware; the payload names this server)
                     ("GET" | "HEAD", "/system/version.json") if site.oidc.is_some() => {
-                        let session =
-                            site.security.oauth2_session(auth.cookie.as_deref());
+                        let session = auth.oauth2_identity.clone();
                         if site.oidc.as_ref().unwrap().is_admin(session.as_ref()) {
                             cors_json(json!({"sweet-server": env!("CARGO_PKG_VERSION")}))
                         } else {
@@ -407,10 +447,11 @@ pub(crate) struct Auth {
     /// else "http" — the reference's argv.url is http, so direct traffic
     /// keeps parity while proxied sitemap.xml locs stop lying
     proto: String,
-    /// the Cookie header (oauth2 session lookups) and the Origin header
-    /// (better-auth-style CSRF gate on sign-out) — oidc.rs reads both
-    cookie: Option<String>,
+    /// the Origin header — better-auth-style CSRF gate on sign-out
     origin: Option<String>,
+    /// oauth2 mode: the signed-cookie identity {id, username, name},
+    /// decoded once per request
+    oauth2_identity: Option<Value>,
 }
 
 /// The reference farm's refusal, byte-for-byte: 400 + error-page.js

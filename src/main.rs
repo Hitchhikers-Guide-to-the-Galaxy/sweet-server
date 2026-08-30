@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 mod actions;
 mod assets;
+mod indexes;
 mod plugmatic;
 mod search;
 mod security;
@@ -44,6 +45,8 @@ struct Site {
     /// comma-separated neighborhood seed injected into the shell, like the
     /// node server's argv.neighbors -> seedNeighbors
     neighbors: Option<String>,
+    /// memoised sitemap/site-index (see indexes.rs)
+    index_cache: indexes::Cache,
 }
 
 /// Farm mode (--farm <root>): the Host header picks an EXISTING site dir
@@ -64,8 +67,15 @@ struct Farm {
 }
 
 impl Farm {
-    fn site_for(&self, host: &str) -> Option<Arc<Site>> {
+    /// Host normalisation shared with the refusal page: port stripped,
+    /// lowercased, and "www." treated as absent (farm.js:149-152).
+    fn normalize(host: &str) -> String {
         let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+        host.strip_prefix("www.").unwrap_or(&host).to_string()
+    }
+
+    fn site_for(&self, host: &str) -> Option<Arc<Site>> {
+        let host = Self::normalize(host);
         let name = match host.split_once('.') {
             Some((first, rest)) if first.starts_with(self.prefix.as_str()) => {
                 format!("{}.{}", &first[self.prefix.len()..], rest)
@@ -89,6 +99,7 @@ impl Farm {
             sweet_client: self.sweet_client.clone(),
             sweet_plugins: self.sweet_plugins.clone(),
             neighbors: self.neighbors.clone(),
+            index_cache: Default::default(),
         });
         self.cache.write().unwrap().insert(name, site.clone());
         Some(site)
@@ -175,6 +186,7 @@ async fn main() {
             sweet_client,
             sweet_plugins,
             neighbors,
+            index_cache: Default::default(),
         }))
     };
     let serving = Arc::new(serving);
@@ -195,19 +207,31 @@ async fn main() {
                 }
                 let cookie = header_str(&req, header::COOKIE);
                 let content_type = header_str(&req, header::CONTENT_TYPE);
-                let req_host = header_str(&req, header::HOST)
-                    .unwrap_or_else(|| "localhost".into());
+                let proto = header_str(
+                    &req,
+                    header::HeaderName::from_static("x-forwarded-proto"),
+                )
+                .and_then(|v| v.split(',').next().map(|p| p.trim().to_string()))
+                .filter(|p| p == "https")
+                .unwrap_or_else(|| "http".into());
+                let host_header = header_str(&req, header::HOST);
+                let req_host = host_header.clone().unwrap_or_else(|| "localhost".into());
                 let site = match serving.as_ref() {
                     Serving::Single(site) => site.clone(),
-                    Serving::Farm(farm) => match farm.site_for(&req_host) {
-                        Some(site) => site,
-                        None => {
+                    Serving::Farm(farm) => {
+                        // farm.js:139-169: no Host is a 400; a host the farm
+                        // will not serve gets the reference's refusal page
+                        let Some(hh) = host_header.as_deref() else {
                             return Response::builder()
-                                .status(StatusCode::NOT_FOUND)
-                                .body(Body::from("Unknown wiki"))
-                                .unwrap()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(Body::from("Missing host header"))
+                                .unwrap();
+                        };
+                        match farm.site_for(hh) {
+                            Some(site) => site,
+                            None => return wiki_does_not_exist(hh),
                         }
-                    },
+                    }
                 };
                 let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
                     .await
@@ -218,6 +242,7 @@ async fn main() {
                     authorized,
                     user: site.security.user(cookie.as_deref()),
                     host: req_host.clone(),
+                    proto,
                 };
                 // sweet-client mode answers shell/app/api paths first; the
                 // wiki API below keeps serving either way
@@ -303,6 +328,81 @@ struct Auth {
     authorized: bool,
     user: bool,
     host: String,
+    /// "https" only when X-Forwarded-Proto says so (a TLS proxy in front),
+    /// else "http" — the reference's argv.url is http, so direct traffic
+    /// keeps parity while proxied sitemap.xml locs stop lying
+    proto: String,
+}
+
+/// The reference farm's refusal, byte-for-byte: 400 + error-page.js
+/// render('Requested Wiki Does Not Exist', ...) with the parent domain as
+/// the suggested destination (farm.js:158-169). Raw res.end — no
+/// content-type header.
+fn wiki_does_not_exist(host: &str) -> Response {
+    let inc = Farm::normalize(host);
+    let up = inc.split('.').skip(1).collect::<Vec<_>>().join(".");
+    let body = error_page(
+        "Requested Wiki Does Not Exist",
+        "The wiki you are trying to access does not exist.",
+        &format!("You may visit <a href='//{up}'>{up}</a> for more information."),
+    );
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// wiki/error-page.js render(), template reproduced exactly.
+fn error_page(title: &str, error_text: &str, message_text: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset=UTF-8>
+    <title>{title}</title>
+    <style>
+    body {{
+        background-image:  url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAMAAAC67D+PAAAABlBMVEXW2N7x8fFtFbdeAAAAKUlEQVR42jXKAQoAAAjCQPf/T8egCaEcbcxgA8MkjhcvsVmapBqJgb4PC6kAOLAu0ikAAAAASUVORK5CYII=');
+    }}
+    section {{
+        background-color: white;
+        width: 490px;
+        box-shadow: 2px 1px 4px rgba(0,0,0,0.2),
+                    inset 0px 0px 40px 0px pink;
+        padding: 30px;
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+    }}
+    header {{
+        margin: 0px;
+    }}
+    header h1:before {{
+        content: '';
+        background: linear-gradient(135deg, #FE9B36, #507D1A);
+        width: 32px;
+        height: 32px;
+        display: inline-block;
+        margin-right: 10px;
+        margin-bottom: -6px;
+    }}
+    header h1 {{
+        margin-top: 0px;
+    }}
+    </style>
+</head>
+<body>
+    <section id="nowiki">
+    <header>
+        <h1>Oops!</h1>
+        <p>{error_text}</p>
+    </header>
+    <p>{message_text}</p>
+    </section>
+</body>
+</html>"#
+    )
 }
 
 fn must_be_owner() -> Response {
@@ -400,21 +500,16 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
         // sitemap only when Date.parse(Last-Modified) beats its cached value
         // (wiki-client neighborhood.js refreshMap) — omit it and search dies
         "/system/sitemap.json" => {
-            let map = sitemap(site);
-            with_last_modified(cors_json(map.clone()), max_date(&map))
+            let map = indexes::sitemap(site);
+            with_last_modified(cors_json_ref(&map), max_date(&map))
         }
         "/system/plugins.json" => cors_json(plugin_names(site)),
         "/system/factories.json" => cors_json(factories(site)),
-        "/sitemap.xml" => sitemap_xml(site, &auth.host),
+        "/sitemap.xml" => sitemap_xml(site, &auth.host, &auth.proto),
         "/system/site-index.json" => {
-            let idx = match read(&site.data.join("status/site-index.json"))
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            {
-                Some(v) => v,
-                None => search::site_index(&site_pages(site)),
-            };
-            let stamp = max_date(&sitemap(site));
-            with_last_modified(cors_json(idx), stamp)
+            let idx = indexes::site_index(site);
+            let stamp = max_date(&indexes::sitemap(site));
+            with_last_modified(cors_json_ref(&idx), stamp)
         }
         "/system/export.json" => {
             let mut map = serde_json::Map::new();
@@ -770,7 +865,7 @@ fn page_json(site: &Site, slug: &str) -> Response {
 
 // ---------------------------------------------------------------- system
 
-fn site_pages(site: &Site) -> Vec<(String, Value)> {
+pub(crate) fn site_pages(site: &Site) -> Vec<(String, Value)> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(site.data.join("pages")) {
         let mut names: Vec<_> = entries
@@ -800,30 +895,29 @@ fn slugs(site: &Site) -> Value {
     )
 }
 
-/// Sitemap entry per spec §8: {slug, title, date, synopsis, links}.
-/// Serves the prebuilt status file when present, else derives from pages.
-fn sitemap(site: &Site) -> Value {
-    if let Some(bytes) = read(&site.data.join("status/sitemap.json")) {
-        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-            return v;
-        }
+/// Sitemap entry per spec §8: {slug, title, date, synopsis, links} —
+/// links omitted when the page coins none (sitemap.js:84-96).
+pub(crate) fn sitemap_entry(slug: &str, page: &Value) -> Value {
+    let mut entry = json!({
+        "slug": slug,
+        "title": page["title"],
+        "date": last_edit_date(page),
+        "synopsis": synopsis(page),
+    });
+    let links = links(page);
+    if !links.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        entry["links"] = links;
     }
+    entry
+}
+
+/// Full derivation from pages/ — the fallback when a site carries no
+/// prebuilt status/sitemap.json. Cached callers go through indexes::sitemap.
+pub(crate) fn derive_sitemap(site: &Site) -> Value {
     Value::Array(
         site_pages(site)
             .into_iter()
-            .map(|(slug, page)| {
-                let mut entry = json!({
-                    "slug": slug,
-                    "title": page["title"],
-                    "date": last_edit_date(&page),
-                    "synopsis": synopsis(&page),
-                });
-                let links = links(&page);
-                if !links.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-                    entry["links"] = links;
-                }
-                entry
-            })
+            .map(|(slug, page)| sitemap_entry(&slug, &page))
             .collect(),
     )
 }
@@ -914,10 +1008,11 @@ fn as_slug(title: &str) -> String {
         .to_lowercase()
 }
 
-fn sitemap_xml(site: &Site, host: &str) -> Response {
+fn sitemap_xml(site: &Site, host: &str, proto: &str) -> Response {
     // the reference's exact shape: standalone declaration, two-space
-    // indent, absolute http://<host> locs, lastmod = entry date YYYY-MM-DD
-    let urls: String = sitemap(site)
+    // indent, absolute <proto>://<host> locs (http unless a proxy set
+    // X-Forwarded-Proto: https), lastmod = entry date YYYY-MM-DD
+    let urls: String = indexes::sitemap(site)
         .as_array()
         .map(|entries| {
             entries
@@ -931,7 +1026,7 @@ fn sitemap_xml(site: &Site, host: &str) -> Response {
                         })
                         .unwrap_or_default();
                     Some(format!(
-                        "\n  <url>\n    <loc>http://{host}/{slug}.html</loc>{lastmod}\n  </url>"
+                        "\n  <url>\n    <loc>{proto}://{host}/{slug}.html</loc>{lastmod}\n  </url>"
                     ))
                 })
                 .collect()
@@ -1090,7 +1185,7 @@ fn with_last_modified(mut resp: Response, ms: u64) -> Response {
     resp
 }
 
-fn read(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
@@ -1104,6 +1199,12 @@ fn with_cors(mut resp: Response) -> Response {
 
 fn cors_json(v: Value) -> Response {
     json_bytes(serde_json::to_vec(&v).unwrap())
+}
+
+/// Serialize from a borrow — the cached indexes are shared Arcs and a
+/// clone of a multi-megabyte Value per request would undo the memoisation.
+fn cors_json_ref(v: &Value) -> Response {
+    json_bytes(serde_json::to_vec(v).unwrap())
 }
 
 fn json_bytes(bytes: Vec<u8>) -> Response {

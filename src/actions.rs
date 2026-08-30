@@ -217,7 +217,12 @@ pub fn apply(site: &Site, slug: &str, mut action: Value) -> Outcome {
     page["journal"].as_array_mut().unwrap().push(action);
 
     match save_page(site, slug, &page) {
-        Ok(()) => Outcome::Ok,
+        Ok(()) => {
+            // server.js:912-917 — sitemaphandler/searchhandler.update after
+            // every action; without it a prebuilt status index goes stale
+            crate::indexes::write_update(site, slug, Some(&page));
+            Outcome::Ok
+        }
         Err(e) => err(500, &e.to_string()),
     }
 }
@@ -232,6 +237,7 @@ pub fn delete_page(site: &Site, slug: &str) -> Result<(), (u16, String)> {
     std::fs::create_dir_all(recycle_dir(site))
         .and_then(|_| std::fs::rename(&src, recycle_dir(site).join(slug)))
         .map_err(|e| (500, format!("Server {e}")))
+        .map(|()| crate::indexes::write_update(site, slug, None))
 }
 
 pub fn recycler_slugs(site: &Site) -> Value {

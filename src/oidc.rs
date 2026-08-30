@@ -88,11 +88,30 @@ impl Oidc {
             let raw = cfg[k].as_str().unwrap_or(default);
             raw.strip_prefix("token.").unwrap_or(raw).to_string()
         };
+        // social configs carry oauth2_discoveryUrl; passportjs configs
+        // (the live farms') carry oauth2_AuthorizationURL instead — for a
+        // Keycloak-shaped one the issuer is the part before
+        // /protocol/openid-connect/auth, and discovery hangs off that.
+        let discovery_url = cfg["oauth2_discoveryUrl"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| {
+                cfg["oauth2_AuthorizationURL"].as_str().and_then(|a| {
+                    a.strip_suffix("/protocol/openid-connect/auth")
+                        .map(|iss| format!("{iss}/.well-known/openid-configuration"))
+                })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "--oidc-config {path:?} missing oauth2_discoveryUrl \
+                     (or a Keycloak-shaped oauth2_AuthorizationURL)"
+                )
+            })?;
         Ok(Oidc {
             cfg: Cfg {
                 client_id: need("oauth2_clientID")?,
                 client_secret: need("oauth2_clientSecret")?,
-                discovery_url: need("oauth2_discoveryUrl")?,
+                discovery_url,
                 id_field: field_name("oauth2_IdField", "sub"),
                 username_field: field_name("oauth2_UsernameField",
                                            "preferred_username"),
@@ -701,6 +720,18 @@ impl std::error::Error for UreqBridgeError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passportjs_authorization_url_derives_discovery() {
+        let auth = "https://auth.example.org/realms/wiki/protocol/openid-connect/auth";
+        let derived = auth
+            .strip_suffix("/protocol/openid-connect/auth")
+            .map(|iss| format!("{iss}/.well-known/openid-configuration"));
+        assert_eq!(
+            derived.as_deref(),
+            Some("https://auth.example.org/realms/wiki/.well-known/openid-configuration")
+        );
+    }
+
     #[test]
     fn passportjs_dotted_field_names_normalise() {
         // the live farm configs carry oauth2_IdField "token.preferred_username"

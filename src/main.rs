@@ -288,6 +288,8 @@ async fn main() {
                 }
                 let cookie = header_str(&req, header::COOKIE);
                 let origin = header_str(&req, header::ORIGIN);
+                let api_key =
+                    header_str(&req, header::HeaderName::from_static("x-api-key"));
                 let content_type = header_str(&req, header::CONTENT_TYPE);
                 let proto = header_str(
                     &req,
@@ -340,6 +342,7 @@ async fn main() {
                     host: req_host.clone(),
                     proto,
                     origin,
+                    api_key,
                     oauth2_identity,
                 };
                 // sweet-client mode answers shell/app/api paths first; the
@@ -488,6 +491,8 @@ pub(crate) struct Auth {
     proto: String,
     /// the Origin header — better-auth-style CSRF gate on sign-out
     origin: Option<String>,
+    /// X-Api-Key — the farm gate's headless-writer door (api.rs keys)
+    api_key: Option<String>,
     /// oauth2 mode: the signed-cookie identity {id, username, name},
     /// decoded once per request
     oauth2_identity: Option<Value>,
@@ -662,6 +667,14 @@ fn api_route(
         _ => {
             let entry = api.find(method, path)?;
             if entry.writes() {
+                // key -> place -> person: a valid key short-circuits the rest
+                let scope = format!("{}.{}", entry.short, entry.op_id);
+                let key_holder = api::authorize_key(
+                    Path::new(&ctx.status),
+                    auth.api_key.as_deref(),
+                    &scope,
+                );
+                if key_holder.is_none() {
                 if let Some((status, msg)) = api::write_refusal(&ctx.origin, auth.authorized)
                 {
                     return Some(
@@ -671,6 +684,7 @@ fn api_route(
                             .body(Body::from(entry.error_body(&msg).to_string()))
                             .unwrap(),
                     );
+                }
                 }
             }
             Some(match entry.call(api, query, &ctx) {

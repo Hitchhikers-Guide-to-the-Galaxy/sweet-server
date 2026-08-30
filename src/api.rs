@@ -673,7 +673,84 @@ fn context_meaning(sites: &[String]) -> Value {
     })
 }
 
-// gate.js — place and person; keys are Phase 2.
+// keys.js — the API-key door (Phase 2): a site opts in by writing
+// {status}/api-keys.json; scopes are "*" or "<plugin>.<operation>";
+// cached by mtime so an edit needs no restart; constant-time compare.
+
+type KeyCache = std::collections::HashMap<PathBuf, (std::time::SystemTime, Option<Value>)>;
+
+fn key_cache() -> &'static std::sync::Mutex<KeyCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<KeyCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(KeyCache::new()))
+}
+
+fn load_keys(status_dir: &Path) -> Option<Value> {
+    let file = status_dir.join("api-keys.json");
+    let Ok(meta) = std::fs::metadata(&file) else {
+        key_cache().lock().unwrap().remove(status_dir);
+        return None;
+    };
+    let mtime = meta.modified().ok()?;
+    let mut cache = key_cache().lock().unwrap();
+    if let Some((cached_mtime, keys)) = cache.get(status_dir) {
+        if *cached_mtime == mtime {
+            return keys.clone();
+        }
+    }
+    let keys = match std::fs::read(&file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    {
+        Some(v) => Some(v),
+        None => {
+            eprintln!("caution: {}: could not be parsed", file.display());
+            None
+        }
+    };
+    cache.insert(status_dir.to_path_buf(), (mtime, keys.clone()));
+    keys
+}
+
+/// keys.js same(): length check then XOR accumulate — a wrong key cannot
+/// be found a character at a time.
+fn same_secret(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn find_in(bucket: &Value, presented: &str) -> Option<Value> {
+    for (secret, holder) in bucket.as_object().into_iter().flatten() {
+        if same_secret(secret, presented) {
+            return Some(if holder.is_object() {
+                holder.clone()
+            } else {
+                json!({"id": "unnamed"})
+            });
+        }
+    }
+    None
+}
+
+/// keys.js authorize(): the scope bucket first, then "*". Returns the
+/// holder record so the change can be attributed.
+pub fn authorize_key(
+    status_dir: &Path,
+    presented: Option<&str>,
+    scope: &str,
+) -> Option<Value> {
+    let presented = presented?;
+    let keys = load_keys(status_dir)?;
+    find_in(&keys[scope], presented).or_else(|| find_in(&keys["*"], presented))
+}
+
+// gate.js — place and person; a valid key short-circuits both.
 
 fn is_private_site(origin: &str) -> bool {
     let host = origin.split(':').next().unwrap_or("").to_lowercase();

@@ -47,6 +47,10 @@ struct Site {
     neighbors: Option<String>,
     /// memoised sitemap/site-index (see indexes.rs)
     index_cache: indexes::Cache,
+    /// --tint <css-color>: appended to /theme/style.css as a .page
+    /// background so a reader can SEE a site is served by sweet (the farm
+    /// toggle's visual marker). Off by default — parity surfaces unchanged.
+    tint: Option<String>,
 }
 
 /// Farm mode (--farm <root>): the Host header picks an EXISTING site dir
@@ -63,6 +67,7 @@ struct Farm {
     sweet_client: Option<PathBuf>,
     sweet_plugins: Option<PathBuf>,
     neighbors: Option<String>,
+    tint: Option<String>,
     cache: std::sync::RwLock<std::collections::HashMap<String, Arc<Site>>>,
 }
 
@@ -100,6 +105,7 @@ impl Farm {
             sweet_plugins: self.sweet_plugins.clone(),
             neighbors: self.neighbors.clone(),
             index_cache: Default::default(),
+            tint: self.tint.clone(),
         });
         self.cache.write().unwrap().insert(name, site.clone());
         Some(site)
@@ -124,6 +130,7 @@ async fn main() {
     let mut sweet_plugins: Option<PathBuf> = None;
     let mut neighbors: Option<String> = None;
     let mut farm: Option<PathBuf> = None;
+    let mut tint: Option<String> = None;
     let mut farm_prefix = "sweet-".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -144,6 +151,7 @@ async fn main() {
             "--sweet-plugins" => sweet_plugins = args.next().map(PathBuf::from),
             "--neighbors" => neighbors = args.next(),
             "--farm" => farm = args.next().map(PathBuf::from),
+            "--tint" => tint = args.next(),
             "--farm-prefix" => {
                 if let Some(p) = args.next() {
                     farm_prefix = p;
@@ -161,6 +169,7 @@ async fn main() {
             sweet_client,
             sweet_plugins,
             neighbors,
+            tint,
             cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         }))
     } else {
@@ -187,6 +196,7 @@ async fn main() {
             sweet_plugins,
             neighbors,
             index_cache: Default::default(),
+            tint,
         }))
     };
     let serving = Arc::new(serving);
@@ -1105,9 +1115,22 @@ fn favicon(site: &Site) -> Response {
 /// spec QUIRK (server.js:502).
 fn theme(site: &Site, path: &str) -> Response {
     let file = site.data.join("status/theme").join(&path[7..]);
+    if path == "/theme/style.css" {
+        // the site theme, plus the sweet tint marker when --tint is set —
+        // theme loads after style.css so this wins over the white paper
+        let mut bytes = read(&file).unwrap_or_default();
+        if let Some(tint) = &site.tint {
+            bytes.extend_from_slice(
+                format!(
+                    "\n/* served by sweet-server (--tint) */\n.page {{ background-color: {tint}; }}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        return serve_bytes(bytes, "text/css");
+    }
     match read(&file) {
         Some(bytes) => serve_bytes(bytes, guess_mime(path)),
-        None if path == "/theme/style.css" => serve_bytes(Vec::new(), "text/css"),
         None => not_found("Not found"),
     }
 }

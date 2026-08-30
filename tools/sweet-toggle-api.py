@@ -13,18 +13,34 @@ Sibling of ~/bin/sweet-switch on the laptop — same snippet, same rules
 (door groups flip together, preflight before routing, ETag = node probe),
 but local to the host so a wiki page can drive it. Toggling is routing
 only; a site on sweet is READ-ONLY until toggled back.
+
+GATED BY KEYCLOAK (--wiki-config): the OIDC code flow against the same
+`wiki` client the farm's hitchhiker-passport security uses — clientID,
+secret and endpoints are read from the host's own wiki config (mode 600,
+same user). Every route except /auth/* needs a session; the UI's sibling
+fetches ride the same-site cookie (all *.private.fish is one site), and a
+401 from the sibling renders a sign-in link that SSO usually completes
+silently. Sessions are in-memory: a restart signs everyone out.
 """
 
 import argparse
 import datetime
 import json
 import re
+import secrets as pysecrets
 import subprocess
 import sys
+import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 CFG = None  # argparse namespace
+OIDC = None  # dict: client_id, client_secret, auth_url, token_url, userinfo_url
+SESSIONS = {}  # cookie token -> {"user": str, "exp": epoch}
+PENDING = {}  # oauth state -> {"next": str, "exp": epoch}
+SESSION_TTL = 7 * 86400
+COOKIE = "toggleSession"
 
 
 def utcnow():
@@ -141,6 +157,124 @@ def toggle(site, to):
     return {"toggled": doors, "to": to}
 
 
+# ---------------------------------------------------------------- auth
+
+def load_oidc():
+    """The farm's own oauth2 settings — the wiki client, reused."""
+    cfg = json.loads(Path(CFG.wiki_config).read_text())
+    auth_url = cfg["oauth2_AuthorizationURL"]
+    base = auth_url.rsplit("/auth", 1)[0]
+    return {
+        "client_id": cfg["oauth2_clientID"],
+        "client_secret": cfg["oauth2_clientSecret"],
+        "auth_url": auth_url,
+        "token_url": cfg.get("oauth2_TokenURL") or f"{base}/token",
+        "userinfo_url": f"{base}/userinfo",
+    }
+
+
+def prune(store):
+    now = time.time()
+    for k in [k for k, v in store.items() if v["exp"] < now]:
+        store.pop(k, None)
+
+
+def safe_next(next_url):
+    """Only relative paths or https URLs on our own private names."""
+    if next_url.startswith("/") and not next_url.startswith("//"):
+        return next_url
+    try:
+        u = urllib.parse.urlsplit(next_url)
+    except ValueError:
+        return "/"
+    if u.scheme in ("http", "https") and (
+            u.hostname or "").endswith((".private.fish", ".local")):
+        return next_url
+    return "/"
+
+
+def session_user(cookie_header):
+    prune(SESSIONS)
+    for part in (cookie_header or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == COOKIE and v in SESSIONS:
+            return SESSIONS[v]["user"]
+    return None
+
+
+def auth_login(query):
+    q = urllib.parse.parse_qs(query)
+    nxt = safe_next(q.get("next", ["/"])[0])
+    prune(PENDING)
+    state = pysecrets.token_urlsafe(24)
+    PENDING[state] = {"next": nxt, "exp": time.time() + 600}
+    params = urllib.parse.urlencode({
+        "client_id": OIDC["client_id"],
+        "redirect_uri": f"{CFG.public_url}/auth/callback",
+        "response_type": "code",
+        "scope": "openid",
+        "state": state,
+    })
+    return 302, f"{OIDC['auth_url']}?{params}", None
+
+
+def auth_callback(query):
+    """code+state -> token -> userinfo -> session cookie. Secrets travel
+    to curl over stdin, never argv."""
+    q = urllib.parse.parse_qs(query)
+    state = q.get("state", [""])[0]
+    code = q.get("code", [""])[0]
+    pending = PENDING.pop(state, None)
+    if not pending or pending["exp"] < time.time() or not code:
+        return 403, None, {"error": "bad or expired auth state — retry login"}
+    form = urllib.parse.urlencode({
+        "grant_type": "authorization_code",
+        "client_id": OIDC["client_id"],
+        "client_secret": OIDC["client_secret"],
+        "code": code,
+        "redirect_uri": f"{CFG.public_url}/auth/callback",
+    })
+    rc, out, err = sh(
+        f'curl -s --max-time 15 -X POST '
+        f'-H "Content-Type: application/x-www-form-urlencoded" '
+        f'--data-binary @- {OIDC["token_url"]}', stdin=form)
+    try:
+        token = json.loads(out)["access_token"]
+    except (json.JSONDecodeError, KeyError):
+        return 502, None, {"error": f"token exchange failed: {out[:200]}"}
+    rc, out, err = sh(
+        f'curl -s --max-time 15 -H @- {OIDC["userinfo_url"]}',
+        stdin=f"Authorization: Bearer {token}\n")
+    try:
+        info = json.loads(out)
+        user = info.get("preferred_username") or info["sub"]
+    except (json.JSONDecodeError, KeyError):
+        return 502, None, {"error": f"userinfo failed: {out[:200]}"}
+    if CFG.allow_users and user not in CFG.allow_users:
+        return 403, None, {"error": f"user '{user}' is not on the allow list"}
+    tok = pysecrets.token_urlsafe(32)
+    prune(SESSIONS)
+    SESSIONS[tok] = {"user": user, "exp": time.time() + SESSION_TTL}
+    return 302, pending["next"], (
+        f"{COOKIE}={tok}; Path=/; Max-Age={SESSION_TTL}; "
+        f"HttpOnly; Secure; SameSite=Lax")
+
+
+LOGIN_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Sweet Toggle — sign in</title>
+<style>:root{color-scheme:light dark}
+body{font:14px/1.6 system-ui,sans-serif;margin:1.2rem}</style></head><body>
+<p><b>Sweet Toggle</b> — flipping wiki routing needs a Keycloak sign-in.</p>
+<p><a id="go" target="_top" href="/auth/login">Sign in with Keycloak</a></p>
+<script>
+// come back to the wiki page this panel is embedded in
+const back = document.referrer || location.href;
+document.getElementById("go").href =
+  "/auth/login?next=" + encodeURIComponent(back);
+</script></body></html>
+"""
+
+
 # ---------------------------------------------------------------- ui
 
 UI = """<!DOCTYPE html>
@@ -169,7 +303,8 @@ UI = """<!DOCTYPE html>
 </style></head><body>
 <div class="note">Toggle a wiki between the <b>node server</b> and the
 <b>Sweet Server</b> (Rust, classic client, read-only while toggled — flip
-back to edit). Links open the live site through its normal door.</div>
+back to edit). Links open the live site through its normal door.
+Signed in as <b id="who"></b> · <a href="/auth/logout" target="_top">sign out</a></div>
 <input id="filter" type="search" placeholder="filter sites…"
   style="font: inherit; padding: 0.2em 0.6em; margin-bottom: 0.4rem;
          border-radius: 6px; border: 1px solid rgba(128,128,128,0.5);
@@ -177,6 +312,7 @@ back to edit). Links open the live site through its normal door.</div>
 <div id="hosts"></div>
 <script>
 const APIS = __APIS__;
+document.getElementById("who").textContent = __USER__;
 const hostsDiv = document.getElementById("hosts");
 
 // stable section order + visible loading state, whatever answers first
@@ -196,7 +332,9 @@ document.getElementById("filter").addEventListener("input", e => {
 });
 
 async function fetchStatus(api) {
-  const r = await fetch(api + "/api/status", {cache: "no-store"});
+  const r = await fetch(api + "/api/status",
+    {cache: "no-store", credentials: "include"});
+  if (r.status === 401) throw new Error("401");
   if (!r.ok) throw new Error(r.status);
   return r.json();
 }
@@ -207,6 +345,14 @@ function render(api, data, err) {
     sec = document.createElement("section");
     sec.id = "h-" + api;
     hostsDiv.appendChild(sec);
+  }
+  if (err === "401") {
+    // Keycloak SSO usually completes this without a prompt
+    sec.innerHTML = "<h2>" + api + "</h2><div class='note'>"
+      + "not signed in on this host — <a target='_top' href='" + api
+      + "/auth/login?next=" + encodeURIComponent(document.referrer
+        || location.href) + "'>sign in</a></div>";
+    return;
   }
   if (err) {
     sec.innerHTML = "<h2>" + api + "</h2><div class='err'>unreachable: "
@@ -247,7 +393,8 @@ async function doToggle(api, site, to, btn) {
   btn.disabled = true;
   try {
     const r = await fetch(api + "/api/toggle", {
-      method: "POST", headers: {"Content-Type": "application/json"},
+      method: "POST", credentials: "include",
+      headers: {"Content-Type": "application/json"},
       body: JSON.stringify({site, to})});
     const j = await r.json();
     if (!r.ok) alert(j.error || r.status);
@@ -264,33 +411,78 @@ setInterval(refresh, 30000);
 # ---------------------------------------------------------------- http
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", set_cookie=None,
+              location=None):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # credentialed CORS: reflect only our own panel origins — a
+        # wildcard would refuse the session cookie
+        origin = self.headers.get("Origin", "")
+        if origin and origin.rstrip("/") in [a.rstrip("/") for a in CFG.apis]:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Cache-Control", "no-store")
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
+        if location:
+            self.send_header("Location", location)
         self.end_headers()
         self.wfile.write(data)
 
     def do_OPTIONS(self):
         self._send(204, b"")
 
+    def _user(self):
+        return session_user(self.headers.get("Cookie"))
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            ui = UI.replace("__APIS__", json.dumps(CFG.apis))
-            self._send(200, ui.encode(), "text/html; charset=utf-8")
-        elif self.path == "/api/status":
-            self._send(200, status_payload())
-        else:
-            self._send(404, {"error": "not found"})
+        path, _, query = self.path.partition("?")
+        if path == "/auth/login":
+            code, loc, _ = auth_login(query)
+            return self._send(code, b"", location=loc)
+        if path == "/auth/callback":
+            code, loc, extra = auth_callback(query)
+            if code == 302:
+                return self._send(code, b"", set_cookie=extra, location=loc)
+            return self._send(code, extra)
+        if path == "/auth/logout":
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == COOKIE:
+                    SESSIONS.pop(v, None)
+            return self._send(302, b"", location="/",
+                              set_cookie=f"{COOKIE}=; Path=/; Max-Age=0")
+        user = self._user()
+        if path in ("/", "/index.html"):
+            if not user:
+                return self._send(200, LOGIN_PAGE.encode(),
+                                  "text/html; charset=utf-8")
+            ui = (UI.replace("__APIS__", json.dumps(CFG.apis))
+                    .replace("__USER__", json.dumps(user)))
+            return self._send(200, ui.encode(), "text/html; charset=utf-8")
+        if not user:
+            return self._send(401, {"error": "login required",
+                                    "login": f"{CFG.public_url}/auth/login"})
+        if path == "/api/status":
+            return self._send(200, status_payload())
+        self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/api/toggle":
+        if self.path.partition("?")[0] != "/api/toggle":
             return self._send(404, {"error": "not found"})
+        user = self._user()
+        if not user:
+            return self._send(401, {"error": "login required",
+                                    "login": f"{CFG.public_url}/auth/login"})
+        # JSON content-type is the CSRF gate: cross-site forms cannot send
+        # it without a preflight, and preflight only passes our origins
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self._send(415, {"error": "application/json only"})
         try:
             n = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(n) or b"{}")
@@ -299,6 +491,7 @@ class Handler(BaseHTTPRequestHandler):
             if to not in ("sweet", "node") or not re.fullmatch(
                     r"[a-z0-9.-]{1,120}", site):
                 return self._send(400, {"error": "need site + to=sweet|node"})
+            sys.stderr.write(f"{utcnow()} TOGGLE {site} -> {to} by {user}\n")
             self._send(200, toggle(site, to))
         except (ValueError, RuntimeError) as e:
             self._send(409, {"error": str(e)})
@@ -320,11 +513,23 @@ def main():
     ap.add_argument("--sudo", default="")
     ap.add_argument("--apis", nargs="+", required=True,
                     help="API base URLs the UI should query (this host first)")
-    global CFG
+    ap.add_argument("--wiki-config", required=True,
+                    help="the farm's config JSON — supplies the Keycloak "
+                         "oauth2 client the login gate reuses")
+    ap.add_argument("--public-url", required=True,
+                    help="this API's front-door origin, e.g. "
+                         "https://toggle.pi5.private.fish (the registered "
+                         "redirect URI is <public-url>/auth/callback)")
+    ap.add_argument("--allow-users", nargs="*", default=None,
+                    help="optional username allowlist; default = any "
+                         "authenticated realm user")
+    global CFG, OIDC
     CFG = ap.parse_args()
+    OIDC = load_oidc()
     srv = ThreadingHTTPServer(("127.0.0.1", CFG.port), Handler)
     sys.stderr.write(f"sweet-toggle-api [{CFG.label}] on 127.0.0.1:{CFG.port} "
-                     f"snippet={CFG.snippet} sweet=:{CFG.sweet_port}\n")
+                     f"snippet={CFG.snippet} sweet=:{CFG.sweet_port} "
+                     f"auth={OIDC['auth_url']}\n")
     srv.serve_forever()
 
 

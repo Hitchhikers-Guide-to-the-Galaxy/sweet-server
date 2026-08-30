@@ -189,6 +189,11 @@ impl Security {
             "oauth2": {"id": identity["id"], "username": identity["username"]},
         });
         let pretty = serde_json::to_string_pretty(&id).unwrap();
+        // the node server pre-creates status/ at boot; a fresh sweet site
+        // may not have it yet (claim 500'd on a bare data dir — live find)
+        if let Some(dir) = id_file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         if std::fs::write(id_file, pretty).is_err() {
             return Err(500);
         }

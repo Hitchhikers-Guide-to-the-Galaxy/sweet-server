@@ -26,6 +26,7 @@ use std::sync::Arc;
 mod actions;
 mod assets;
 mod indexes;
+mod oidc;
 mod plugmatic;
 mod search;
 mod security;
@@ -51,6 +52,8 @@ struct Site {
     /// background so a reader can SEE a site is served by sweet (the farm
     /// toggle's visual marker). Off by default — parity surfaces unchanged.
     tint: Option<String>,
+    /// Mode::OAuth2 only: the OIDC flow state (see oidc.rs)
+    oidc: Option<Arc<oidc::Oidc>>,
 }
 
 /// Farm mode (--farm <root>): the Host header picks an EXISTING site dir
@@ -106,6 +109,7 @@ impl Farm {
             neighbors: self.neighbors.clone(),
             index_cache: Default::default(),
             tint: self.tint.clone(),
+            oidc: None, // farm mode stays read-only until Phase 4
         });
         self.cache.write().unwrap().insert(name, site.clone());
         Some(site)
@@ -131,6 +135,7 @@ async fn main() {
     let mut neighbors: Option<String> = None;
     let mut farm: Option<PathBuf> = None;
     let mut tint: Option<String> = None;
+    let mut oidc_config: Option<PathBuf> = None;
     let mut farm_prefix = "sweet-".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -152,6 +157,7 @@ async fn main() {
             "--neighbors" => neighbors = args.next(),
             "--farm" => farm = args.next().map(PathBuf::from),
             "--tint" => tint = args.next(),
+            "--oidc-config" => oidc_config = args.next().map(PathBuf::from),
             "--farm-prefix" => {
                 if let Some(p) = args.next() {
                     farm_prefix = p;
@@ -178,9 +184,24 @@ async fn main() {
         // --security_legacy softens the default stub, else read-only (spec §6.2)
         let mode = match security_type.as_deref() {
             Some(t) if t.contains("friends") => security::Mode::Friends,
-            Some(other) => panic!("unsupported security_type {other:?} (only friends)"),
+            // "social" is the node module's name for the same mode —
+            // accepted so a wiki config can be reused verbatim
+            Some("oauth2") | Some("social") => security::Mode::OAuth2,
+            Some(other) => {
+                panic!("unsupported security_type {other:?} (friends|oauth2)")
+            }
             None if security_legacy => security::Mode::Legacy,
             None => security::Mode::Default,
+        };
+        let oidc = if matches!(mode, security::Mode::OAuth2) {
+            let path = oidc_config
+                .expect("--security_type oauth2 requires --oidc-config <wiki-config.json>");
+            match oidc::Oidc::from_config_file(&path) {
+                Ok(o) => Some(Arc::new(o)),
+                Err(e) => panic!("{e}"),
+            }
+        } else {
+            None
         };
         // multer's dest option creates assets/uploads at plugin startup — the
         // assets list route then answers {error:null, files:[]} on a fresh site
@@ -197,6 +218,7 @@ async fn main() {
             neighbors,
             index_cache: Default::default(),
             tint,
+            oidc,
         }))
     };
     let serving = Arc::new(serving);
@@ -216,6 +238,7 @@ async fn main() {
                         .map(String::from)
                 }
                 let cookie = header_str(&req, header::COOKIE);
+                let origin = header_str(&req, header::ORIGIN);
                 let content_type = header_str(&req, header::CONTENT_TYPE);
                 let proto = header_str(
                     &req,
@@ -253,6 +276,8 @@ async fn main() {
                     user: site.security.user(cookie.as_deref()),
                     host: req_host.clone(),
                     proto,
+                    cookie: cookie.clone(),
+                    origin,
                 };
                 // sweet-client mode answers shell/app/api paths first; the
                 // wiki API below keeps serving either way
@@ -262,6 +287,46 @@ async fn main() {
                     return resp;
                 }
                 match (method.as_str(), path.as_str()) {
+                    // oauth2 security routes (oidc.rs; OIDC-SECURITY-SPEC.md)
+                    ("POST", "/auth/sign-in/oauth2") if site.oidc.is_some() => {
+                        oidc::sign_in(site.oidc.as_ref().unwrap(), &auth, &body)
+                    }
+                    ("GET" | "HEAD", "/auth/oauth2/callback/oauth2")
+                        if site.oidc.is_some() =>
+                    {
+                        oidc::callback(site.oidc.as_ref().unwrap(), &site, &auth, &query)
+                    }
+                    ("POST", "/auth/sign-out") if site.oidc.is_some() => {
+                        oidc::sign_out(&site, &auth)
+                    }
+                    ("GET" | "HEAD", "/auth/client-settings.json")
+                        if site.oidc.is_some() =>
+                    {
+                        oidc::client_settings(site.oidc.as_ref().unwrap(), &site, &auth)
+                    }
+                    ("GET" | "HEAD", "/auth/loginDialog") if site.oidc.is_some() => {
+                        oidc::login_dialog(&auth)
+                    }
+                    ("GET" | "HEAD", "/auth/loginDone") if site.oidc.is_some() => {
+                        oidc::login_done(&site, &auth)
+                    }
+                    ("GET" | "HEAD", "/auth/claim-wiki") if site.oidc.is_some() => {
+                        oidc::claim_wiki(&site, &auth)
+                    }
+                    ("GET" | "HEAD", "/logout") if site.oidc.is_some() => {
+                        oidc::logout(&site, &auth)
+                    }
+                    // admin-gated version answer (social.js isAdmin ->
+                    // admin middleware; the payload names this server)
+                    ("GET" | "HEAD", "/system/version.json") if site.oidc.is_some() => {
+                        let session =
+                            site.security.oauth2_session(auth.cookie.as_deref());
+                        if site.oidc.as_ref().unwrap().is_admin(session.as_ref()) {
+                            cors_json(json!({"sweet-server": env!("CARGO_PKG_VERSION")}))
+                        } else {
+                            security::forbidden()
+                        }
+                    }
                     // friends security routes (spec §6.3)
                     ("POST", "/login") => {
                         let _ = std::fs::create_dir_all(site.data.join("status"));
@@ -334,7 +399,7 @@ async fn main() {
 /// Per-request facts the read routes need: recycler gating, the shell's
 /// owner variables, and the Host header (absolute urls in sitemap.xml).
 #[derive(Clone)]
-struct Auth {
+pub(crate) struct Auth {
     authorized: bool,
     user: bool,
     host: String,
@@ -342,6 +407,10 @@ struct Auth {
     /// else "http" — the reference's argv.url is http, so direct traffic
     /// keeps parity while proxied sitemap.xml locs stop lying
     proto: String,
+    /// the Cookie header (oauth2 session lookups) and the Origin header
+    /// (better-auth-style CSRF gate on sign-out) — oidc.rs reads both
+    cookie: Option<String>,
+    origin: Option<String>,
 }
 
 /// The reference farm's refusal, byte-for-byte: 400 + error-page.js
@@ -577,16 +646,23 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
         p if p.starts_with("/assets/") => serve_file(site.data.join(&p[1..]), guess_mime(p)),
         p if p.starts_with("/theme/") => theme(site, p),
         p if p.starts_with("/plugins/") => plugin_static(site, p),
-        // security module's client (server.js:337-340; friends by default)
+        // security module's client (server.js:337-340) — the package
+        // matches the mode: oauth2 serves wiki-security-social's client
+        // (padlock, dialog, better-auth bundle), everything else friends
         p if p.starts_with("/security/") => {
             let file = &p["/security/".len()..];
             if file.contains("..") {
                 return not_found("Not found");
             }
+            let package = if site.oidc.is_some() {
+                "wiki-security-social/client"
+            } else {
+                "wiki-security-friends/client"
+            };
             match site
                 .vendor
                 .as_ref()
-                .and_then(|v| read(&v.join("wiki-security-friends/client").join(file)))
+                .and_then(|v| read(&v.join(package).join(file)))
             {
                 Some(bytes) => serve_bytes(bytes, guess_mime(p)),
                 None => not_found("Not found"),

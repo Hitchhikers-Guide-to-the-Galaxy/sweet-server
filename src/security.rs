@@ -27,17 +27,29 @@ pub enum Mode {
     Default,
     Legacy,
     Friends,
+    /// `--security_type oauth2|social` + `--oidc-config`: the OIDC code
+    /// flow (Sweet Keycloak Plan Phase 2). Sessions store ONLY the mapped
+    /// identity {id, username, name} — never the provider's tokens — so
+    /// the cookie stays bytes-small (BUGS.toml social-fat-token-431 is
+    /// the cautionary tale). Authorisation compares the session id to
+    /// owner.json's oauth2.id, the shape every real farm site carries.
+    OAuth2,
 }
 
 pub struct Security {
     pub mode: Mode,
-    /// owner.json content: {"name": .., "friend": {"secret": ..}}
+    /// owner.json content: {"name": .., "friend": {"secret": ..}} or the
+    /// passportjs/social shape {"name": .., "oauth2": {"id": .., ..}}
     owner: Mutex<Option<serde_json::Value>>,
-    /// session token (cookie value) -> friend secret
+    /// session token (cookie value) -> friend secret (Friends) or the
+    /// serialized mapped identity JSON (OAuth2)
     sessions: Mutex<HashMap<String, String>>,
 }
 
 const COOKIE: &str = "wikiSession";
+/// oauth2-mode session cookie — named like the oracle's so the L6
+/// cookie-shape assertions (and a future compact-mirror) line up
+pub const OAUTH2_COOKIE: &str = "fedwiki.session_token";
 
 fn rand_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
@@ -74,12 +86,16 @@ impl Security {
             .and_then(|o| o["friend"]["secret"].as_str().map(String::from))
     }
 
-    /// The `wikiSession` value carried by a Cookie header.
-    fn session_token(cookie_header: Option<&str>) -> Option<String> {
+    fn cookie_value(cookie_header: Option<&str>, name: &str) -> Option<String> {
         cookie_header?.split(';').find_map(|part| {
             let (k, v) = part.trim().split_once('=')?;
-            (k == COOKIE && !v.is_empty()).then(|| v.to_string())
+            (k == name && !v.is_empty()).then(|| v.to_string())
         })
+    }
+
+    /// The `wikiSession` value carried by a Cookie header.
+    fn session_token(cookie_header: Option<&str>) -> Option<String> {
+        Self::cookie_value(cookie_header, COOKIE)
     }
 
     fn session_friend(&self, cookie_header: Option<&str>) -> Option<String> {
@@ -90,7 +106,11 @@ impl Security {
     /// getUser — friends returns `true` when a session friend exists
     /// (friends.coffee:82-86), the stub always '' (security.js:68-70).
     pub fn user(&self, cookie_header: Option<&str>) -> bool {
-        matches!(self.mode, Mode::Friends) && self.session_friend(cookie_header).is_some()
+        match self.mode {
+            Mode::Friends => self.session_friend(cookie_header).is_some(),
+            Mode::OAuth2 => self.oauth2_session(cookie_header).is_some(),
+            _ => false,
+        }
     }
 
     /// isAuthorized — gates every write and the recycler reads.
@@ -103,7 +123,85 @@ impl Security {
                 (Some(friend), Some(secret)) => friend == secret,
                 _ => false,
             },
+            // social.js isAuthorized: unclaimed -> open for everyone;
+            // claimed -> the session identity must match owner.oauth2.id
+            // (string compare on both sides, like the oracle's toString())
+            Mode::OAuth2 => {
+                let owner = self.owner.lock().unwrap().clone();
+                match owner {
+                    None => true,
+                    Some(o) => match self.oauth2_session(cookie_header) {
+                        Some(u) => {
+                            let oid = json_as_string(&o["oauth2"]["id"]);
+                            !oid.is_empty() && oid == json_as_string(&u["id"])
+                        }
+                        None => false,
+                    },
+                }
+            }
         }
+    }
+
+    // ------------------------------------------------------- oauth2 mode
+
+    /// The mapped identity {id, username, name} for the request's
+    /// fedwiki.session_token cookie, if a session exists.
+    pub fn oauth2_session(&self, cookie_header: Option<&str>) -> Option<serde_json::Value> {
+        if !matches!(self.mode, Mode::OAuth2) {
+            return None;
+        }
+        let token = Self::cookie_value(cookie_header, OAUTH2_COOKIE)?;
+        let stored = self.sessions.lock().unwrap().get(&token).cloned()?;
+        serde_json::from_str(&stored).ok()
+    }
+
+    /// Store a mapped identity; returns the Set-Cookie header value.
+    pub fn oauth2_grant(&self, identity: &serde_json::Value, secure: bool) -> String {
+        let token = rand_hex(24);
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(token.clone(), identity.to_string());
+        format!(
+            "{OAUTH2_COOKIE}={token}; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax{}",
+            if secure { "; Secure" } else { "" }
+        )
+    }
+
+    /// GET /auth/claim-wiki (social.js): owner absent -> write owner.json
+    /// in the passportjs shape and answer the owner name; present -> 403.
+    pub fn oauth2_claim(
+        &self,
+        id_file: &Path,
+        identity: &serde_json::Value,
+    ) -> Result<String, u16> {
+        let mut owner = self.owner.lock().unwrap();
+        if owner.is_some() {
+            return Err(403);
+        }
+        let name = identity["name"]
+            .as_str()
+            .or(identity["username"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = json!({
+            "name": name,
+            "oauth2": {"id": identity["id"], "username": identity["username"]},
+        });
+        let pretty = serde_json::to_string_pretty(&id).unwrap();
+        if std::fs::write(id_file, pretty).is_err() {
+            return Err(500);
+        }
+        *owner = Some(id);
+        Ok(name)
+    }
+
+    /// Drop the request's oauth2 session; returns the clearing Set-Cookie.
+    pub fn oauth2_signout(&self, cookie_header: Option<&str>) -> String {
+        if let Some(token) = Self::cookie_value(cookie_header, OAUTH2_COOKIE) {
+            self.sessions.lock().unwrap().remove(&token);
+        }
+        format!("{OAUTH2_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
     }
 
     fn grant_session(&self, secret: &str) -> String {
@@ -192,6 +290,15 @@ impl Security {
         } else {
             plain(StatusCode::UNAUTHORIZED, "Unauthorized")
         }
+    }
+}
+
+/// JS toString() for the id comparison: strings bare, numbers printed.
+fn json_as_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
     }
 }
 

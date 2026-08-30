@@ -24,10 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod actions;
+mod api;
 mod assets;
 mod indexes;
 mod oidc;
 mod plugmatic;
+mod sidecar;
 mod search;
 mod security;
 mod sweetmode;
@@ -54,6 +56,10 @@ struct Site {
     tint: Option<String>,
     /// Mode::OAuth2 only: the OIDC flow state (see oidc.rs)
     oidc: Option<Arc<oidc::Oidc>>,
+    /// --url: the site's own absolute URL, the reference's argv.url —
+    /// context for the fedwiki.api door (api.json servers block, handler
+    /// context). Default mirrors defaultargs: http://localhost:<port>.
+    url: String,
 }
 
 /// Farm mode (--farm <root>): the Host header picks an EXISTING site dir
@@ -121,6 +127,7 @@ impl Farm {
             index_cache: Default::default(),
             tint: self.tint.clone(),
             oidc: self.oidc.clone(),
+            url: format!("http://{host}"),
         });
         self.cache.write().unwrap().insert(name, site.clone());
         Some(site)
@@ -148,6 +155,7 @@ async fn main() {
     let mut tint: Option<String> = None;
     let mut oidc_config: Option<PathBuf> = None;
     let mut farm_security: Option<String> = None;
+    let mut url: Option<String> = None;
     let mut farm_prefix = "sweet-".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -171,6 +179,7 @@ async fn main() {
             "--tint" => tint = args.next(),
             "--oidc-config" => oidc_config = args.next().map(PathBuf::from),
             "--farm-security" => farm_security = args.next(),
+            "--url" => url = args.next(),
             "--farm-prefix" => {
                 if let Some(p) = args.next() {
                     farm_prefix = p;
@@ -246,14 +255,27 @@ async fn main() {
             index_cache: Default::default(),
             tint,
             oidc,
+            url: url.unwrap_or_else(|| format!("http://localhost:{port}")),
         }))
     };
     let serving = Arc::new(serving);
+    // the fedwiki.api door: built lazily on first use, only when the
+    // vendor carries wiki-plugin-farm (parity: no farm plugin, no door)
+    let api_state: Arc<std::sync::OnceLock<Option<Arc<api::Api>>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let api_vendor = match serving.as_ref() {
+        Serving::Single(site) => site.vendor.clone(),
+        Serving::Farm(farm) => farm.vendor.clone(),
+    };
 
     let app = axum::Router::new().fallback({
         let serving = serving.clone();
+        let api_state = api_state.clone();
+        let api_vendor = api_vendor.clone();
         move |req: Request<Body>| {
             let serving = serving.clone();
+            let api_state = api_state.clone();
+            let api_vendor = api_vendor.clone();
             async move {
                 let method = req.method().clone();
                 let path = req.uri().path().to_string();
@@ -326,6 +348,23 @@ async fn main() {
                     sweetmode::route(&site, method.as_str(), &path, &query, &body, &auth)
                 {
                     return resp;
+                }
+                // the fedwiki.api door (api.rs) — reference farm-plugin
+                // routes under /system/api
+                if path.starts_with("/system/api") {
+                    let state = api_state.get_or_init(|| {
+                        api_vendor
+                            .as_ref()
+                            .filter(|v| v.join("wiki-plugin-farm").is_dir())
+                            .map(|v| Arc::new(api::Api::build(v, port)))
+                    });
+                    if let Some(api) = state {
+                        if let Some(resp) = api_route(
+                            api, &site, method.as_str(), &path, &query, &body, &auth, port,
+                        ) {
+                            return resp;
+                        }
+                    }
                 }
                 match (method.as_str(), path.as_str()) {
                     // oauth2 security routes (oidc.rs; OIDC-SECURITY-SPEC.md)
@@ -523,6 +562,146 @@ fn error_page(title: &str, error_text: &str, message_text: &str) -> String {
 </body>
 </html>"#
     )
+}
+
+/// Routes under /system/api — the fedwiki.api door. None = fall through
+/// (e.g. try.json, Phase 3) so the page route can 404 normally.
+#[allow(clippy::too_many_arguments)]
+fn api_route(
+    api: &api::Api,
+    site: &Site,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    auth: &Auth,
+    port: u16,
+) -> Option<Response> {
+    let ctx = api::SiteContext::for_site(site, port);
+    let cors = |mut resp: Response| {
+        let h = resp.headers_mut();
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, OPTIONS"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Accept, Content-Type"),
+        );
+        resp
+    };
+    match (method, path) {
+        ("GET" | "HEAD", "/system/api.json") => {
+            let origin = format!("{}://{}", auth.proto, auth.host);
+            let doc = api.document(&origin, &ctx);
+            Some(cors(cors_json(doc)))
+        }
+        ("OPTIONS", "/system/api.json") => Some(cors(
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap(),
+        )),
+        ("GET" | "HEAD", "/system/api/mcp") => Some(
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                .body(Body::from(
+                    json!({"error": "this endpoint answers POST only — it opens no event stream"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        ),
+        ("POST", "/system/api/mcp") => {
+            if !api::origin_allowed(auth.origin.as_deref(), &auth.host) {
+                return Some(
+                    Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                        .body(Body::from(
+                            json!({"error": "cross-origin requests are not accepted here"})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                );
+            }
+            let origin = format!("{}://{}", auth.proto, auth.host);
+            let doc = api.document(&origin, &ctx);
+            let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let reply = if let Some(batch) = parsed.as_array() {
+                let replies: Vec<Value> = batch
+                    .iter()
+                    .filter_map(|m| {
+                        wrap_mcp(api, &doc, &ctx, m)
+                    })
+                    .collect();
+                if replies.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(replies))
+                }
+            } else {
+                wrap_mcp(api, &doc, &ctx, &parsed)
+            };
+            Some(match reply {
+                Some(v) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                    .body(Body::from(v.to_string()))
+                    .unwrap(),
+                None => Response::builder()
+                    .status(StatusCode::ACCEPTED)
+                    .body(Body::empty())
+                    .unwrap(),
+            })
+        }
+        _ => {
+            let entry = api.find(method, path)?;
+            if entry.writes() {
+                if let Some((status, msg)) = api::write_refusal(&ctx.origin, auth.authorized)
+                {
+                    return Some(
+                        Response::builder()
+                            .status(StatusCode::from_u16(status).unwrap())
+                            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                            .body(Body::from(entry.error_body(&msg).to_string()))
+                            .unwrap(),
+                    );
+                }
+            }
+            Some(match entry.call(api, query, &ctx) {
+                Ok(value) => cors_json(value),
+                Err((status, msg)) => Response::builder()
+                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                    .body(Body::from(entry.error_body(&msg).to_string()))
+                    .unwrap(),
+            })
+        }
+    }
+}
+
+/// mcp handleMessage with the reference's throw-wrapper (INTERNAL_ERROR).
+fn wrap_mcp(
+    api: &api::Api,
+    doc: &Value,
+    ctx: &api::SiteContext,
+    message: &Value,
+) -> Option<Value> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        api::handle_mcp(api, doc, ctx, message)
+    })) {
+        Ok(reply) => reply,
+        Err(_) => Some(api::rpc_error(
+            &message["id"],
+            api::INTERNAL_ERROR,
+            "internal error",
+        )),
+    }
 }
 
 fn must_be_owner() -> Response {

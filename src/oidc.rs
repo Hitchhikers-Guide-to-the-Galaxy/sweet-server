@@ -586,6 +586,10 @@ fn origin_trusted(origin: &str, host: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn url_query_pairs(query: &str) -> HashMap<String, String> {
+    url_query(query)
+}
+
 fn url_query(query: &str) -> HashMap<String, String> {
     query
         .split('&')

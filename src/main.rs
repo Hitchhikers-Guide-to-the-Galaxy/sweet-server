@@ -611,6 +611,30 @@ fn api_route(
                 .body(Body::empty())
                 .unwrap(),
         )),
+        ("POST", "/system/api/try.json") => {
+            // form-posted; ALWAYS 200 page JSON, no CORS (same-origin door)
+            let params: serde_json::Map<String, Value> =
+                match serde_json::from_slice::<Value>(body) {
+                    Ok(Value::Object(m)) => m,
+                    _ => oidc::url_query_pairs(&String::from_utf8_lossy(body))
+                        .into_iter()
+                        .map(|(k, v)| (k, Value::String(v)))
+                        .collect(),
+                };
+            let origin = format!("{}://{}", auth.proto, auth.host);
+            let doc = api.document(&origin, &ctx);
+            let page = api::try_operation(
+                api, &doc, &ctx, &params, &origin, auth.authorized,
+                auth.api_key.as_deref(),
+            );
+            Some(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                    .body(Body::from(page.to_string()))
+                    .unwrap(),
+            )
+        }
         ("GET" | "HEAD", "/system/api/mcp") => Some(
             Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)

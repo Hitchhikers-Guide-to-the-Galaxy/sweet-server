@@ -79,20 +79,25 @@ impl Oidc {
                 .map(String::from)
                 .ok_or_else(|| format!("--oidc-config {path:?} missing {k}"))
         };
+        // passportjs configs spell the mapping fields "token.<claim>"
+        // (the live farms' configs still do); the claim name is the part
+        // after the prefix. Without this, oauth2_IdField
+        // "token.preferred_username" would miss and fall back to sub —
+        // and no existing owner.json would ever authorise.
+        let field_name = |k: &str, default: &str| {
+            let raw = cfg[k].as_str().unwrap_or(default);
+            raw.strip_prefix("token.").unwrap_or(raw).to_string()
+        };
         Ok(Oidc {
             cfg: Cfg {
                 client_id: need("oauth2_clientID")?,
                 client_secret: need("oauth2_clientSecret")?,
                 discovery_url: need("oauth2_discoveryUrl")?,
-                id_field: cfg["oauth2_IdField"].as_str().unwrap_or("sub").into(),
-                username_field: cfg["oauth2_UsernameField"]
-                    .as_str()
-                    .unwrap_or("preferred_username")
-                    .into(),
-                display_field: cfg["oauth2_DisplayNameField"]
-                    .as_str()
-                    .unwrap_or("preferred_username")
-                    .into(),
+                id_field: field_name("oauth2_IdField", "sub"),
+                username_field: field_name("oauth2_UsernameField",
+                                           "preferred_username"),
+                display_field: field_name("oauth2_DisplayNameField",
+                                          "preferred_username"),
                 use_https: cfg["security_useHttps"].as_bool().unwrap_or(false),
                 admin_id: cfg["admin"]["oauth2"].as_str().map(String::from),
                 cookie_secret: match cfg["cookieSecret"].as_str() {
@@ -693,3 +698,17 @@ impl std::fmt::Display for UreqBridgeError {
 }
 
 impl std::error::Error for UreqBridgeError {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn passportjs_dotted_field_names_normalise() {
+        // the live farm configs carry oauth2_IdField "token.preferred_username"
+        let raw = "token.preferred_username";
+        assert_eq!(raw.strip_prefix("token.").unwrap_or(raw),
+                   "preferred_username");
+        let plain = "preferred_username";
+        assert_eq!(plain.strip_prefix("token.").unwrap_or(plain),
+                   "preferred_username");
+    }
+}

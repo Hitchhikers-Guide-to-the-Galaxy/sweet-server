@@ -24,6 +24,20 @@ const SUPPORTED_VERSIONS: [i64; 1] = [1];
 const KNOWN_CONTEXT: [&str; 5] = ["origin", "farmRoot", "status", "url", "port"];
 const METHODS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
 
+/// Phase 4 (Honesty for the Unserved): route prefixes sweet answers
+/// NATIVELY — its own ports of plugin servers. A declarer's
+/// served-by-plugin operation stays described in `paths` only when its
+/// declared path lands on one of these; everything else is excluded and
+/// recorded in `skipped`, because the plugin's own Node server does not
+/// run here and sweet ships no forwarder, by decision.
+const NATIVE_PLUGIN_ROUTES: [&str; 2] = ["/plugin/assets/", "/plugin/plugmatic/"];
+
+fn natively_served(declared_path: &str) -> bool {
+    NATIVE_PLUGIN_ROUTES
+        .iter()
+        .any(|prefix| declared_path.starts_with(prefix))
+}
+
 const INFO_DESCRIPTION: &str = "Every interface this farm offers, merged from what its plugins declare. A plugin declares a specification and a module of plain functions; the farm mounts them and describes them here. Only operations that are actually mounted appear — what was refused or skipped is listed under x-fedwiki-farm. A plugin whose wiki item text is a line-oriented command language publishes that language under x-fedwiki-vocabulary: each command says which parameter it produces, or that it never leaves the browser.";
 
 pub struct Declaration {
@@ -257,6 +271,16 @@ impl Api {
                     if op_id.is_empty() {
                         self.skip(&d.name, &where_,
                             "no operationId, so it cannot be named in the document");
+                        continue;
+                    }
+                    if !natively_served(spec_path) {
+                        // the node farm describes these because the
+                        // plugin's own server answers there; here it does
+                        // not, and a description of a door that is not
+                        // there is a lie — recorded divergence
+                        self.skip(&d.name, &where_, &format!(
+                            "served by {} itself, and that server does not                              run here — no forwarder, by decision",
+                            d.plugin));
                         continue;
                     }
                     self.described.push(Described {

@@ -31,6 +31,7 @@ mod oidc;
 mod plugmatic;
 mod shortlink;
 mod sidecar;
+mod table;
 mod search;
 mod security;
 mod sweetmode;
@@ -488,6 +489,28 @@ async fn main() {
                             None => route(&site, &path, auth),
                         }
                     }
+                    // table plugin page-parity routes (native port — table.rs);
+                    // a non-slug-shaped path falls through to the wiki's own
+                    // routing, and a dark PUT (no key file) falls through
+                    // BEFORE any CORS header, like the reference's next('route')
+                    ("GET" | "HEAD", p) if p.starts_with("/plugin/table/") => {
+                        match table::get_route(&site, p) {
+                            Some(resp) => resp,
+                            None => route(&site, &path, auth),
+                        }
+                    }
+                    ("PUT", p) if p.starts_with("/plugin/table/") => {
+                        match table::put_route(
+                            &site,
+                            p,
+                            &body,
+                            content_type.as_deref(),
+                            auth.api_key.as_deref(),
+                        ) {
+                            Some(resp) => resp,
+                            None => write_route(&site, method.as_str(), &path, &body, authorized),
+                        }
+                    }
                     ("GET" | "HEAD", _) => route(&site, &path, auth),
                     ("PUT" | "DELETE", _) => {
                         write_route(&site, method.as_str(), &path, &body, authorized)
@@ -745,7 +768,16 @@ fn api_route(
                 }
                 }
             }
-            Some(match entry.call(api, query, &ctx) {
+            // table's write persists through the pagehandler — sweet itself
+            // — so it is answered natively (table.rs), like shortlink's
+            // expand; every other handler runs in the sidecar
+            let outcome = if entry.short == "table" && entry.op_id == "write" {
+                api::arguments_for(&entry.op, query, &ctx)
+                    .and_then(|args| table::farm_write(site, &args))
+            } else {
+                entry.call(api, query, &ctx)
+            };
+            Some(match outcome {
                 Ok(value) => cors_json(value),
                 Err((status, msg)) => Response::builder()
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
@@ -1195,7 +1227,7 @@ fn plugin_static(site: &Site, path: &str) -> Response {
 // ---------------------------------------------------------------- pages
 
 /// Read fallback chain, spec §3: site pages/ then default-data pages/.
-fn load_page(site: &Site, slug: &str) -> Option<Vec<u8>> {
+pub(crate) fn load_page(site: &Site, slug: &str) -> Option<Vec<u8>> {
     if slug.is_empty() || slug.contains(['/', '.', '\\']) {
         return None;
     }
@@ -1211,7 +1243,7 @@ fn load_page(site: &Site, slug: &str) -> Option<Vec<u8>> {
 /// Changes comes from wiki-plugin-activity, Local Changes from
 /// wiki-plugin-changes. First plugin in scan order wins, and the served
 /// page is annotated with the plugin's short name.
-fn load_plugin_page(site: &Site, slug: &str) -> Option<Vec<u8>> {
+pub(crate) fn load_plugin_page(site: &Site, slug: &str) -> Option<Vec<u8>> {
     if slug.is_empty() || slug.contains(['/', '.', '\\']) {
         return None;
     }

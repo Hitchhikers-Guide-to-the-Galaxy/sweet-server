@@ -30,7 +30,8 @@ const METHODS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
 /// declared path lands on one of these; everything else is excluded and
 /// recorded in `skipped`, because the plugin's own Node server does not
 /// run here and sweet ships no forwarder, by decision.
-const NATIVE_PLUGIN_ROUTES: [&str; 2] = ["/plugin/assets/", "/plugin/plugmatic/"];
+const NATIVE_PLUGIN_ROUTES: [&str; 3] =
+    ["/plugin/assets/", "/plugin/plugmatic/", "/plugin/shortlink/"];
 
 fn natively_served(declared_path: &str) -> bool {
     NATIVE_PLUGIN_ROUTES
@@ -1136,6 +1137,12 @@ impl Mounted {
         ctx: &SiteContext,
     ) -> Result<Value, (u16, String)> {
         let args = arguments_for(&self.op, query, ctx)?;
+        // shortlink's expand shares the native resolver's failure breaker
+        // (one breaker, not two — the reference reaches one singleton
+        // through the CJS require cache), so it is answered natively
+        if self.short == "shortlink" && self.op_id == "expand" {
+            return crate::shortlink::expand(&args);
+        }
         api.sidecar
             .request(
                 "call",

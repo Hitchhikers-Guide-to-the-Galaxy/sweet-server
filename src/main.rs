@@ -29,6 +29,7 @@ mod assets;
 mod indexes;
 mod oidc;
 mod plugmatic;
+mod shortlink;
 mod sidecar;
 mod search;
 mod security;
@@ -291,6 +292,15 @@ async fn main() {
                 let api_key =
                     header_str(&req, header::HeaderName::from_static("x-api-key"));
                 let content_type = header_str(&req, header::CONTENT_TYPE);
+                let accept = header_str(&req, header::ACCEPT);
+                let xff = header_str(
+                    &req,
+                    header::HeaderName::from_static("x-forwarded-for"),
+                );
+                let remote_ip = req
+                    .extensions()
+                    .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                    .map(|ci| ci.0.ip().to_string());
                 let proto = header_str(
                     &req,
                     header::HeaderName::from_static("x-forwarded-proto"),
@@ -459,6 +469,25 @@ async fn main() {
                     ("POST", "/plugin/plugmatic/install" | "/plugin/plugmatic/restart") => {
                         plugmatic::admin_403()
                     }
+                    // shortlink plugin routes (native port — shortlink.rs);
+                    // a non-key-shaped path falls through to the wiki's own
+                    // routing, exactly like the reference's next()
+                    ("GET" | "HEAD", p) if p.starts_with("/plugin/shortlink/") => {
+                        // XFF is trusted unconditionally, first element wins
+                        // (server.js:45); '?' is the last-resort bucket key
+                        let ip = xff
+                            .as_deref()
+                            .and_then(|v| v.split(',').next())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .or(remote_ip)
+                            .unwrap_or_else(|| "?".into());
+                        match shortlink::route(p, &ip, accept.as_deref()) {
+                            Some(resp) => resp,
+                            None => route(&site, &path, auth),
+                        }
+                    }
                     ("GET" | "HEAD", _) => route(&site, &path, auth),
                     ("PUT" | "DELETE", _) => {
                         write_route(&site, method.as_str(), &path, &body, authorized)
@@ -475,7 +504,12 @@ async fn main() {
         Serving::Single(site) => eprintln!("sweet-server on http://{addr} serving {:?}", site.data),
         Serving::Farm(farm) => eprintln!("sweet-server FARM on http://{addr} over {:?} (prefix {:?}, read-only)", farm.root, farm.prefix),
     }
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// Per-request facts the read routes need: recycler gating, the shell's

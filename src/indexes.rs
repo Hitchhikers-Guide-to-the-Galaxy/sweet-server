@@ -19,6 +19,7 @@
 //! index, write both compact via tmp+rename, and touch status/index-updated
 //! (the flag the reference's startUp uses to schedule a reindex).
 
+use bytes::Bytes;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -30,10 +31,68 @@ use crate::search;
 #[derive(Default)]
 pub struct Cache(Mutex<Option<Entry>>);
 
+/// Compact page-JSON byte cache (Sweet Speedup Plan, Phase 2). Page files
+/// are pretty on disk; the reference parses and re-stringifies compact on
+/// every GET (~68 KB vs the 86 KB raw file). Serving the raw bytes was
+/// fast but 27% heavier on the wire; parsing per request was the cost the
+/// route already paid to validate. This keeps the compact form keyed by
+/// slug and validated by file mtime, so a hot page skips both the parse
+/// and the serialise. Bounded by flush-at-cap: crossing PAGE_CACHE_MAX
+/// clears the map and the hot set re-warms at one miss per page — cruder
+/// than LRU eviction, with the same memory guarantee and no bookkeeping.
+#[derive(Default)]
+pub struct PageCache(Mutex<std::collections::HashMap<String, (SystemTime, Bytes, String)>>);
+
+const PAGE_CACHE_MAX: usize = 512;
+
+impl PageCache {
+    pub fn get(&self, slug: &str, mtime: SystemTime) -> Option<(Bytes, String)> {
+        let g = self.0.lock().unwrap();
+        g.get(slug)
+            .filter(|(m, _, _)| *m == mtime)
+            .map(|(_, b, e)| (b.clone(), e.clone()))
+    }
+    pub fn put(&self, slug: &str, mtime: SystemTime, bytes: Bytes, etag: String) {
+        let mut g = self.0.lock().unwrap();
+        if g.len() >= PAGE_CACHE_MAX {
+            g.clear();
+        }
+        g.insert(slug.to_string(), (mtime, bytes, etag));
+    }
+}
+
 struct Entry {
     stamp: Stamp,
+    // When the pages/ walk last ran. The full walk (a stat per page file)
+    // costs ~0.5 ms on a 585-page site — more than serving the cached
+    // bytes. Between walks a request pays only three stats (pages dir +
+    // both status files): a rename into pages/ (the reference's atomic
+    // write) moves the dir mtime and is caught instantly; an in-place
+    // rewrite is caught by the next walk, at most WALK_EVERY later.
+    // Sweet's own writes bypass all of this via write_update.
+    walked: std::time::Instant,
     sitemap: Arc<Value>,
     site_index: Arc<Value>,
+    // The serialised form, built once per change. Serving re-serialised
+    // 297 KB (sitemap) / 1 MB (site-index) per GET was the live-farm
+    // bench's worst finding (Sweet Speedup Plan, Phase 1): node answers
+    // from cached bytes in ~0.45 ms where re-serialisation cost ~2 ms.
+    // Bytes clones are refcounted, so a request never copies the buffer.
+    sitemap_bytes: Bytes,
+    site_index_bytes: Bytes,
+    // Weak validators, hashed once at build time (Speedup Phase 3). A
+    // per-request hash of a 1 MB buffer would cost more than serving it.
+    sitemap_etag: String,
+    site_index_etag: String,
+}
+
+/// W/"len-hash" — weak, like express's; the exact format is ours to pick,
+/// only stability per byte-identical body matters.
+pub fn etag_of(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("W/\"{:x}-{:x}\"", bytes.len(), h.finish())
 }
 
 /// What must be unchanged for the cache to hold: the pages/ population
@@ -43,12 +102,26 @@ struct Entry {
 struct Stamp {
     page_count: u64,
     pages_mtime: Option<SystemTime>,
+    pages_dir_mtime: Option<SystemTime>,
     sitemap_file: Option<SystemTime>,
     index_file: Option<SystemTime>,
 }
 
+/// How stale an in-place external rewrite may go unnoticed. Renames and
+/// status-file writes are caught instantly by the cheap check.
+const WALK_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// The three stats a between-walks request pays.
+fn cheap_stamp(site: &Site) -> (Option<SystemTime>, Option<SystemTime>, Option<SystemTime>) {
+    (
+        mtime(&site.data.join("pages")),
+        mtime(&site.data.join("status/sitemap.json")),
+        mtime(&site.data.join("status/site-index.json")),
+    )
 }
 
 fn stamp(site: &Site) -> Stamp {
@@ -70,6 +143,7 @@ fn stamp(site: &Site) -> Stamp {
     Stamp {
         page_count: count,
         pages_mtime: newest,
+        pages_dir_mtime: mtime(&site.data.join("pages")),
         sitemap_file: mtime(&site.data.join("status/sitemap.json")),
         index_file: mtime(&site.data.join("status/site-index.json")),
     }
@@ -84,21 +158,49 @@ fn build(site: &Site, stamp: Stamp) -> Entry {
     let site_index = read(&site.data.join("status/site-index.json"))
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .unwrap_or_else(|| search::site_index(&site_pages(site)));
+    // compact, the same bytes node's res.json would send
+    let sitemap_bytes = Bytes::from(serde_json::to_vec(&sitemap).unwrap_or_default());
+    let site_index_bytes = Bytes::from(serde_json::to_vec(&site_index).unwrap_or_default());
     Entry {
         stamp,
+        walked: std::time::Instant::now(),
         sitemap: Arc::new(sitemap),
         site_index: Arc::new(site_index),
+        sitemap_etag: etag_of(&sitemap_bytes),
+        site_index_etag: etag_of(&site_index_bytes),
+        sitemap_bytes,
+        site_index_bytes,
     }
 }
 
-fn cached(site: &Site) -> (Arc<Value>, Arc<Value>) {
-    let now = stamp(site);
+fn cached(site: &Site) -> (Arc<Value>, Arc<Value>, Bytes, Bytes, String, String) {
     let mut guard = site.index_cache.0.lock().unwrap();
-    match guard.as_ref() {
-        Some(e) if e.stamp == now => (e.sitemap.clone(), e.site_index.clone()),
+    // fast path: recent walk + unchanged cheap stamp -> serve as-is
+    if let Some(e) = guard.as_ref() {
+        let (dir, sm, idx) = cheap_stamp(site);
+        if e.walked.elapsed() < WALK_EVERY
+            && dir == e.stamp.pages_dir_mtime
+            && sm == e.stamp.sitemap_file
+            && idx == e.stamp.index_file
+        {
+            return (e.sitemap.clone(), e.site_index.clone(),
+                    e.sitemap_bytes.clone(), e.site_index_bytes.clone(),
+                    e.sitemap_etag.clone(), e.site_index_etag.clone());
+        }
+    }
+    let now = stamp(site);
+    match guard.as_mut() {
+        Some(e) if e.stamp == now => {
+            e.walked = std::time::Instant::now();
+            (e.sitemap.clone(), e.site_index.clone(),
+             e.sitemap_bytes.clone(), e.site_index_bytes.clone(),
+             e.sitemap_etag.clone(), e.site_index_etag.clone())
+        }
         _ => {
             let e = build(site, now);
-            let out = (e.sitemap.clone(), e.site_index.clone());
+            let out = (e.sitemap.clone(), e.site_index.clone(),
+                       e.sitemap_bytes.clone(), e.site_index_bytes.clone(),
+                       e.sitemap_etag.clone(), e.site_index_etag.clone());
             *guard = Some(e);
             out
         }
@@ -111,6 +213,20 @@ pub fn sitemap(site: &Site) -> Arc<Value> {
 
 pub fn site_index(site: &Site) -> Arc<Value> {
     cached(site).1
+}
+
+/// The sitemap's parsed form (for Last-Modified), its served bytes, and
+/// its validator.
+pub fn sitemap_with_bytes(site: &Site) -> (Arc<Value>, Bytes, String) {
+    let (map, _, bytes, _, etag, _) = cached(site);
+    (map, bytes, etag)
+}
+
+/// The site-index bytes and validator, plus the sitemap's parsed form
+/// (its stamp is the Last-Modified for both routes).
+pub fn site_index_with_stamp(site: &Site) -> (Bytes, Arc<Value>, String) {
+    let (map, _, _, bytes, _, etag) = cached(site);
+    (bytes, map, etag)
 }
 
 /// JSON.stringify-compact write via tmp+rename (write-file-atomic's shape).
@@ -148,20 +264,21 @@ pub fn write_update(site: &Site, slug: &str, page: Option<&Value>) {
     // produces (its in-memory incremental adds converge here too)
     let idx = search::site_index(&site_pages(site));
     let status = site.data.join("status");
-    let _ = write_atomic(
-        &status.join("sitemap.json"),
-        &serde_json::to_vec(&sm).unwrap_or_default(),
-    );
-    let _ = write_atomic(
-        &status.join("site-index.json"),
-        &serde_json::to_vec(&idx).unwrap_or_default(),
-    );
+    let sm_bytes = serde_json::to_vec(&sm).unwrap_or_default();
+    let idx_bytes = serde_json::to_vec(&idx).unwrap_or_default();
+    let _ = write_atomic(&status.join("sitemap.json"), &sm_bytes);
+    let _ = write_atomic(&status.join("site-index.json"), &idx_bytes);
     // search.js searchSave touches this flag after every persisted update
     let _ = std::fs::write(status.join("index-updated"), b"");
     let mut guard = site.index_cache.0.lock().unwrap();
     *guard = Some(Entry {
         stamp: stamp(site),
+        walked: std::time::Instant::now(),
         sitemap: Arc::new(sm),
         site_index: Arc::new(idx),
+        sitemap_etag: etag_of(&sm_bytes),
+        site_index_etag: etag_of(&idx_bytes),
+        sitemap_bytes: Bytes::from(sm_bytes),
+        site_index_bytes: Bytes::from(idx_bytes),
     });
 }

@@ -53,6 +53,8 @@ struct Site {
     neighbors: Option<String>,
     /// memoised sitemap/site-index (see indexes.rs)
     index_cache: indexes::Cache,
+    /// compact page-JSON bytes, mtime-validated (see indexes.rs)
+    page_cache: indexes::PageCache,
     /// --tint <css-color>: appended to /theme/style.css as a .page
     /// background so a reader can SEE a site is served by sweet (the farm
     /// toggle's visual marker). Off by default — parity surfaces unchanged.
@@ -141,6 +143,7 @@ impl Farm {
             sweet_plugins: self.sweet_plugins.clone(),
             neighbors: self.neighbors.clone(),
             index_cache: Default::default(),
+            page_cache: Default::default(),
             tint: self.tint.clone(),
             oidc: self.oidc.clone(),
             url: format!("http://{host}"),
@@ -302,6 +305,7 @@ async fn main() {
             sweet_plugins,
             neighbors,
             index_cache: Default::default(),
+            page_cache: Default::default(),
             tint,
             oidc,
             url: url.unwrap_or_else(|| format!("http://localhost:{port}")),
@@ -341,6 +345,8 @@ async fn main() {
                     header_str(&req, header::HeaderName::from_static("x-api-key"));
                 let content_type = header_str(&req, header::CONTENT_TYPE);
                 let accept = header_str(&req, header::ACCEPT);
+                let if_none_match = header_str(&req, header::IF_NONE_MATCH);
+                let range = header_str(&req, header::RANGE);
                 let xff = header_str(
                     &req,
                     header::HeaderName::from_static("x-forwarded-for"),
@@ -402,6 +408,8 @@ async fn main() {
                     origin,
                     api_key,
                     oauth2_identity,
+                    if_none_match,
+                    range,
                 };
                 // sweet-client mode answers shell/app/api paths first; the
                 // wiki API below keeps serving either way
@@ -574,6 +582,14 @@ async fn main() {
         Serving::Single(site) => eprintln!("sweet-server on http://{addr} serving {:?}", site.data),
         Serving::Farm(farm) => eprintln!("sweet-server FARM on http://{addr} over {:?} (prefix {:?}, read-only)", farm.root, farm.prefix),
     }
+    // Server header on every response: the which-server discriminator.
+    // sweet-switch historically read ETag-present-as-node; now that sweet
+    // mints ETags too (Speedup Phase 3), this header is the probe.
+    let app = app.layer(axum::middleware::map_response(|mut r: Response| async move {
+        r.headers_mut()
+            .insert(header::SERVER, HeaderValue::from_static("sweet-server"));
+        r
+    }));
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -600,6 +616,10 @@ pub(crate) struct Auth {
     /// oauth2 mode: the signed-cookie identity {id, username, name},
     /// decoded once per request
     oauth2_identity: Option<Value>,
+    /// If-None-Match — 304s on the cached-bytes routes (Speedup Phase 3)
+    if_none_match: Option<String>,
+    /// Range — single-range 206 on file routes (Speedup Phase 4)
+    range: Option<String>,
 }
 
 /// The reference farm's refusal, byte-for-byte: 400 + error-page.js
@@ -950,16 +970,21 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
         // sitemap only when Date.parse(Last-Modified) beats its cached value
         // (wiki-client neighborhood.js refreshMap) — omit it and search dies
         "/system/sitemap.json" => {
-            let map = indexes::sitemap(site);
-            with_last_modified(cors_json_ref(&map), max_date(&map))
+            let (map, bytes, etag) = indexes::sitemap_with_bytes(site);
+            if inm_matches(&auth, &etag) {
+                return with_last_modified(not_modified(&etag), max_date(&map));
+            }
+            with_last_modified(with_etag(cors_json_shared(bytes), &etag), max_date(&map))
         }
         "/system/plugins.json" => cors_json(plugin_names(site)),
         "/system/factories.json" => cors_json(factories(site)),
         "/sitemap.xml" => sitemap_xml(site, &auth.host, &auth.proto),
         "/system/site-index.json" => {
-            let idx = indexes::site_index(site);
-            let stamp = max_date(&indexes::sitemap(site));
-            with_last_modified(cors_json_ref(&idx), stamp)
+            let (bytes, map, etag) = indexes::site_index_with_stamp(site);
+            if inm_matches(&auth, &etag) {
+                return with_last_modified(not_modified(&etag), max_date(&map));
+            }
+            with_last_modified(with_etag(cors_json_shared(bytes), &etag), max_date(&map))
         }
         "/system/export.json" => {
             let mut map = serde_json::Map::new();
@@ -1014,7 +1039,9 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
                 None => not_found("Page not found"),
             }
         }
-        p if p.starts_with("/assets/") => serve_file(site.data.join(&p[1..]), guess_mime(p)),
+        p if p.starts_with("/assets/") => {
+            serve_file_ranged(site.data.join(&p[1..]), guess_mime(p), auth.range.as_deref())
+        }
         p if p.starts_with("/theme/") => theme(site, p),
         p if p.starts_with("/plugins/") => plugin_static(site, p),
         // security module's client (server.js:337-340) — the package
@@ -1039,7 +1066,9 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
                 None => not_found("Not found"),
             }
         }
-        p if p.ends_with(".json") && !p[1..].contains('/') => page_json(site, &p[1..p.len() - 5]),
+        p if p.ends_with(".json") && !p[1..].contains('/') => {
+            page_json_conditional(site, &p[1..p.len() - 5], auth.if_none_match.as_deref())
+        }
         p if p.ends_with(".html") && !p[1..].contains('/') => {
             shell(site, &[("view".into(), p[1..p.len() - 5].to_string())], auth)
         }
@@ -1305,19 +1334,78 @@ pub(crate) fn load_plugin_page(site: &Site, slug: &str) -> Option<Vec<u8>> {
     None
 }
 
-fn page_json(site: &Site, slug: &str) -> Response {
-    match load_page(site, slug) {
-        // parse to guarantee we never serve a corrupt page as 200 —
-        // spec: unparseable page is a 404, not a garbled body
-        Some(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(_) => json_bytes(bytes),
-            Err(_) => not_found("Error Parsing Page"),
-        },
-        None => match load_plugin_page(site, slug) {
-            Some(bytes) => json_bytes(bytes),
-            None => not_found("Page not found"),
-        },
+fn page_json_conditional(site: &Site, slug: &str, inm: Option<&str>) -> Response {
+    if slug.is_empty() || slug.contains(['/', '.', '\\']) {
+        return not_found("Page not found");
     }
+    // pages/ first, defaults second — the same fallback chain as load_page,
+    // walked here by path so the compact byte cache can key on file mtime.
+    // Serving the parsed page compact (not the pretty disk bytes) matches
+    // the reference's parse-and-stringify wire form; the parse was already
+    // paid per request to reject corrupt pages as 404, the cache now keeps
+    // its result (Sweet Speedup Plan, Phase 2; validators Phase 3).
+    let mut candidates = vec![site.data.join("pages").join(slug)];
+    if let Some(d) = &site.defaults {
+        candidates.push(d.join("pages").join(slug));
+    }
+    for path in candidates {
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if let Some((bytes, etag)) = site.page_cache.get(slug, mtime) {
+            if inm.is_some_and(|v| v.contains(etag.as_str())) {
+                return not_modified(&etag);
+            }
+            return with_etag(cors_json_shared(bytes), &etag);
+        }
+        let Some(raw) = read(&path) else { continue };
+        // spec: unparseable page is a 404, not a garbled body
+        return match serde_json::from_slice::<Value>(&raw) {
+            Ok(v) => {
+                let bytes =
+                    bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+                let etag = indexes::etag_of(&bytes);
+                site.page_cache.put(slug, mtime, bytes.clone(), etag.clone());
+                if inm.is_some_and(|v| v.contains(etag.as_str())) {
+                    return not_modified(&etag);
+                }
+                with_etag(cors_json_shared(bytes), &etag)
+            }
+            Err(_) => not_found("Error Parsing Page"),
+        };
+    }
+    match load_plugin_page(site, slug) {
+        Some(bytes) => json_bytes(bytes),
+        None => not_found("Page not found"),
+    }
+}
+
+/// If-None-Match check for the index routes. Contains-match handles the
+/// header's list form; weak-vs-strong nuance doesn't arise (we only ever
+/// mint weak tags and never serve byte ranges of these routes).
+fn inm_matches(auth: &Auth, etag: &str) -> bool {
+    auth.if_none_match
+        .as_deref()
+        .is_some_and(|v| v.contains(etag))
+}
+
+fn with_etag(mut resp: Response, etag: &str) -> Response {
+    if let Ok(v) = HeaderValue::from_str(etag) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    resp
+}
+
+fn not_modified(etag: &str) -> Response {
+    with_etag(
+        with_cors(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .body(Body::empty())
+                .unwrap(),
+        ),
+        etag,
+    )
 }
 
 // ---------------------------------------------------------------- system
@@ -1589,6 +1677,104 @@ fn serve_file(path: PathBuf, mime: &str) -> Response {
     }
 }
 
+/// Whole files over this stream from disk instead of loading into memory —
+/// a video must not cost its own size in resident memory (Speedup Phase 4).
+const STREAM_OVER: u64 = 1 << 20;
+
+/// One range spec, RFC 9110 §14: `Ok(Some)` = satisfiable single range,
+/// `Ok(None)` = ignore the header and serve 200 (malformed or multipart —
+/// ignoring is what the RFC allows and what keeps us simple), `Err` = a
+/// syntactically valid range that nothing satisfies -> 416.
+fn parse_range(h: &str, len: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(spec) = h.strip_prefix("bytes=") else {
+        return Ok(None);
+    };
+    if spec.contains(',') || len == 0 {
+        return Ok(None);
+    }
+    let Some((a, b)) = spec.split_once('-') else {
+        return Ok(None);
+    };
+    match (a.trim(), b.trim()) {
+        ("", suffix) => match suffix.parse::<u64>() {
+            Ok(0) => Err(()),
+            Ok(n) => Ok(Some((len.saturating_sub(n), len - 1))),
+            Err(_) => Ok(None),
+        },
+        (start, "") => match start.parse::<u64>() {
+            Ok(s) if s < len => Ok(Some((s, len - 1))),
+            Ok(_) => Err(()),
+            Err(_) => Ok(None),
+        },
+        (start, end) => match (start.parse::<u64>(), end.parse::<u64>()) {
+            (Ok(s), Ok(e)) if s <= e && s < len => Ok(Some((s, e.min(len - 1)))),
+            (Ok(_), Ok(_)) => Err(()),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// File serving with Accept-Ranges/206 (media seek) and streamed bodies
+/// for large files. The reference's express static stack does both; the
+/// asset routes are where <audio>/<video>/<img> point.
+fn serve_file_ranged(path: PathBuf, mime: &str, range: Option<&str>) -> Response {
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return not_found("Not found");
+    };
+    if !meta.is_file() {
+        return not_found("Not found");
+    }
+    let len = meta.len();
+    match range.map(|r| parse_range(r, len)) {
+        Some(Ok(Some((start, end)))) => {
+            use std::io::{Read, Seek, SeekFrom};
+            let n = (end - start + 1) as usize;
+            let Ok(mut f) = std::fs::File::open(&path) else {
+                return not_found("Not found");
+            };
+            let mut buf = vec![0u8; n];
+            if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut buf).is_err() {
+                return not_found("Not found");
+            }
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, mime)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                .body(Body::from(buf))
+                .unwrap()
+        }
+        Some(Err(())) => Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+            .body(Body::empty())
+            .unwrap(),
+        _ => {
+            if len > STREAM_OVER {
+                let Ok(f) = std::fs::File::open(&path) else {
+                    return not_found("Not found");
+                };
+                let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(f));
+                return Response::builder()
+                    .header(header::CONTENT_TYPE, mime)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_LENGTH, len)
+                    .body(Body::from_stream(stream))
+                    .unwrap();
+            }
+            match read(&path) {
+                Some(bytes) => {
+                    let mut resp = serve_bytes(bytes, mime);
+                    resp.headers_mut()
+                        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                    resp
+                }
+                None => not_found("Not found"),
+            }
+        }
+    }
+}
+
 fn guess_mime(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("png") => "image/png",
@@ -1673,8 +1859,20 @@ fn cors_json(v: Value) -> Response {
 
 /// Serialize from a borrow — the cached indexes are shared Arcs and a
 /// clone of a multi-megabyte Value per request would undo the memoisation.
+#[allow(dead_code)]
 fn cors_json_ref(v: &Value) -> Response {
     json_bytes(serde_json::to_vec(v).unwrap())
+}
+
+/// Serve pre-serialised shared bytes — a Bytes clone is a refcount bump,
+/// so the big index buffers are built once per change, not per request.
+fn cors_json_shared(bytes: bytes::Bytes) -> Response {
+    with_cors(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(Body::from(bytes))
+            .unwrap(),
+    )
 }
 
 fn json_bytes(bytes: Vec<u8>) -> Response {

@@ -14,6 +14,22 @@
 //! stores the session *inside* an encrypted cookie with a per-boot secret;
 //! we keep an in-process token map — behaviourally identical for a single
 //! server lifetime (both forget sessions on restart unless configured).
+//!
+//! With a `cookieSecret` supplied (`--farm-config`, the farm's own config
+//! file) the token becomes a STATELESS SIGNED value instead, exactly as the
+//! oauth2 path does: `b64({h, exp}).hmac`. That is what a real farm needs —
+//! the laptop's private farm pins `cookieSecret` precisely so logins survive
+//! a restart, and re-pasting a reclaim code across sixty-odd sites after
+//! every restart is not a workflow. The payload deliberately carries an
+//! HMAC of the owner secret, never the secret itself: the friend secret IS
+//! the reclaim code, so putting it in a cookie would hand the site away.
+//! Re-claiming a site changes its secret, which invalidates old cookies for
+//! free.
+//!
+//! `owner.json` is re-read when its stat stamp changes (the pattern
+//! indexes.rs already uses). Without that a claim needs a server restart to
+//! be seen — harmless single-site, useless across a farm where claiming is
+//! the first thing anyone does. Sweet Farm Plan, Phase 1.
 
 use axum::body::Body;
 use axum::http::{header, StatusCode};
@@ -42,8 +58,15 @@ pub struct Security {
     /// passportjs/social shape {"name": .., "oauth2": {"id": .., ..}}
     owner: Mutex<Option<serde_json::Value>>,
     /// session token (cookie value) -> friend secret (Friends) or the
-    /// serialized mapped identity JSON (OAuth2)
+    /// serialized mapped identity JSON (OAuth2). Unused once a
+    /// `cookie_secret` makes sessions stateless.
     sessions: Mutex<HashMap<String, String>>,
+    /// where `owner` was read from, so it can be re-read on change
+    id_file: std::path::PathBuf,
+    /// (mtime_ns, len) of id_file at the last read; None = file absent
+    owner_stamp: Mutex<Option<(u128, u64)>>,
+    /// farm `cookieSecret` — present turns friends sessions stateless
+    cookie_secret: Option<String>,
 }
 
 const COOKIE: &str = "wikiSession";
@@ -51,26 +74,96 @@ const COOKIE: &str = "wikiSession";
 /// cookie-shape assertions (and a future compact-mirror) line up
 pub const OAUTH2_COOKIE: &str = "fedwiki.session_token";
 
+const SESSION_TTL_SECS: u64 = 7 * 86400;
+
+fn hmac_hex(secret: &str, payload: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        .expect("hmac accepts any key length");
+    mac.update(payload.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn b64(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn rand_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     getrandom::getrandom(&mut buf).expect("os randomness");
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// (mtime_ns, len) — cheap identity for a file, the same shape indexes.rs
+/// uses to decide whether a cached index is still the truth.
+fn stamp_of(path: &Path) -> Option<(u128, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let ns = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((ns, md.len()))
+}
+
+fn read_owner(id_file: &Path) -> Option<serde_json::Value> {
+    // retrieveOwner (friends.coffee:47-60): unparsable file -> name-only
+    std::fs::read(id_file)
+        .ok()
+        .map(|data| serde_json::from_slice(&data).unwrap_or(json!({"name": "unparsable"})))
+}
+
 impl Security {
     pub fn new(mode: Mode, id_file: &Path) -> Self {
-        // retrieveOwner (friends.coffee:47-60): unparsable file -> name-only
-        let owner = std::fs::read(id_file).ok().map(|data| {
-            serde_json::from_slice(&data).unwrap_or(json!({"name": "unparsable"}))
-        });
+        Self::with_cookie_secret(mode, id_file, None)
+    }
+
+    /// As `new`, plus the farm's `cookieSecret` — which makes Friends
+    /// sessions stateless (see the module header).
+    pub fn with_cookie_secret(mode: Mode, id_file: &Path, cookie_secret: Option<String>) -> Self {
         Security {
             mode,
-            owner: Mutex::new(owner),
+            owner: Mutex::new(read_owner(id_file)),
             sessions: Mutex::new(HashMap::new()),
+            id_file: id_file.to_path_buf(),
+            owner_stamp: Mutex::new(stamp_of(id_file)),
+            cookie_secret,
         }
     }
 
+    /// Re-read owner.json when its stat stamp has moved. Called from every
+    /// reader, so a claim, a reclaim or a hand-edit is visible without a
+    /// restart. A file that appears or vanishes counts as a change.
+    fn refresh_owner(&self) {
+        let now = stamp_of(&self.id_file);
+        let mut stamp = self.owner_stamp.lock().unwrap();
+        if *stamp == now {
+            return;
+        }
+        *stamp = now;
+        *self.owner.lock().unwrap() = read_owner(&self.id_file);
+    }
+
     pub fn owner_name(&self) -> Option<String> {
+        self.refresh_owner();
         self.owner
             .lock()
             .unwrap()
@@ -79,6 +172,7 @@ impl Security {
     }
 
     fn owner_secret(&self) -> Option<String> {
+        self.refresh_owner();
         self.owner
             .lock()
             .unwrap()
@@ -100,7 +194,24 @@ impl Security {
 
     fn session_friend(&self, cookie_header: Option<&str>) -> Option<String> {
         let token = Self::session_token(cookie_header)?;
-        self.sessions.lock().unwrap().get(&token).cloned()
+        match &self.cookie_secret {
+            // stateless: the cookie proves it was minted for THIS site's
+            // current owner secret, and the secret itself never left here
+            Some(key) => {
+                let (body, sig) = token.rsplit_once('.')?;
+                if hmac_hex(key, body) != sig {
+                    return None;
+                }
+                let claim: serde_json::Value =
+                    serde_json::from_slice(&b64_decode(body)?).ok()?;
+                if claim["exp"].as_u64()? < now_secs() {
+                    return None;
+                }
+                let secret = self.owner_secret()?;
+                (claim["h"].as_str()? == hmac_hex(key, &secret)).then_some(secret)
+            }
+            None => self.sessions.lock().unwrap().get(&token).cloned(),
+        }
     }
 
     /// getUser — friends returns `true` when a session friend exists
@@ -113,6 +224,7 @@ impl Security {
 
     /// isAuthorized — gates every write and the recycler reads.
     pub fn is_authorized(&self, cookie_header: Option<&str>) -> bool {
+        self.refresh_owner();
         match self.mode {
             Mode::Default => false,
             // stub: anonymous edit only while unclaimed (security.js:72-84)
@@ -182,12 +294,17 @@ impl Security {
 
 
     fn grant_session(&self, secret: &str) -> String {
-        let token = rand_hex(24);
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(token.clone(), secret.to_string());
-        token
+        let Some(key) = self.cookie_secret.as_deref() else {
+            let token = rand_hex(24);
+            self.sessions
+                .lock()
+                .unwrap()
+                .insert(token.clone(), secret.to_string());
+            return token;
+        };
+        let claim = json!({"h": hmac_hex(key, secret), "exp": now_secs() + SESSION_TTL_SECS});
+        let body = b64(claim.to_string().as_bytes());
+        format!("{body}.{}", hmac_hex(key, &body))
     }
 
     fn set_cookie(token: &str) -> String {
@@ -233,6 +350,8 @@ impl Security {
             return plain(StatusCode::NOT_FOUND, "Page not found");
         }
         if let Some(token) = Self::session_token(cookie_header) {
+            // stateless sessions have nothing to forget here — the cleared
+            // cookie below IS the logout, exactly as client-sessions reset()
             self.sessions.lock().unwrap().remove(&token);
         }
         Response::builder()

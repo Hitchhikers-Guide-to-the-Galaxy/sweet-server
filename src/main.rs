@@ -8,7 +8,8 @@
 //!
 //! Usage: sweet-server --data <site-dir> [--port 4251] [--host 127.0.0.1]
 //!        [--defaults <dir>] [--vendor <node_modules>]
-//!        [--security_legacy | --security_type friends]
+//!        [--security_legacy | --security_type friends|hitchhiker]
+//!        [--farm <root> [--farm-security friends --farm-config <cfg.json>]]
 //! `--defaults` points at wiki-server's default-data dir, which supplies
 //! the fallback pages (a missing slug may legitimately 200) and the
 //! default favicon — spec §3 read fallback chain.
@@ -85,6 +86,13 @@ struct Farm {
     /// Keycloak Plan Phase 4. One Oidc (and one signed-cookie secret)
     /// serves the whole farm; authorisation stays per-site.
     oidc: Option<Arc<oidc::Oidc>>,
+    /// --farm-security friends: farmed sites run Mode::Friends, the claim
+    /// model every laptop/Pi private farm already uses (and which
+    /// `wiki-security-hitchhiker` is a fork of). The farm's own
+    /// `cookieSecret`, read from --farm-config, makes each site's session
+    /// stateless so a restart does not sign the operator out of every site
+    /// at once.
+    friends_secret: Option<String>,
     cache: std::sync::RwLock<std::collections::HashMap<String, Arc<Site>>>,
 }
 
@@ -113,10 +121,16 @@ impl Farm {
         }
         let mode = if self.oidc.is_some() {
             security::Mode::OAuth2
+        } else if self.friends_secret.is_some() {
+            security::Mode::Friends
         } else {
             security::Mode::Default
         };
-        let sec = security::Security::new(mode, &data.join("status/owner.json"));
+        let sec = security::Security::with_cookie_secret(
+            mode,
+            &data.join("status/owner.json"),
+            self.friends_secret.clone(),
+        );
         let site = Arc::new(Site {
             data,
             defaults: self.defaults.clone(),
@@ -157,6 +171,10 @@ async fn main() {
     let mut tint: Option<String> = None;
     let mut oidc_config: Option<PathBuf> = None;
     let mut farm_security: Option<String> = None;
+    // --farm-config <wiki-config.json>: the farm's OWN config file, read
+    // for `cookieSecret` under --farm-security friends. Same stance as
+    // --oidc-config: a mode-600 file, so the secret is never in argv.
+    let mut farm_config: Option<PathBuf> = None;
     let mut url: Option<String> = None;
     let mut farm_prefix = "sweet-".to_string();
     let mut args = std::env::args().skip(1);
@@ -181,6 +199,7 @@ async fn main() {
             "--tint" => tint = args.next(),
             "--oidc-config" => oidc_config = args.next().map(PathBuf::from),
             "--farm-security" => farm_security = args.next(),
+            "--farm-config" => farm_config = args.next().map(PathBuf::from),
             "--url" => url = args.next(),
             "--farm-prefix" => {
                 if let Some(p) = args.next() {
@@ -201,8 +220,30 @@ async fn main() {
                     Err(e) => panic!("{e}"),
                 }
             }
-            Some(other) => panic!("unsupported --farm-security {other:?} (oauth2)"),
-            None => None, // read-only Default — the shadow-farm behaviour
+            _ => None, // friends, or read-only Default — see below
+        };
+        let farm_friends = match farm_security.as_deref() {
+            Some(t) if t.contains("friends") || t == "hitchhiker" => {
+                let path = farm_config.clone().expect(
+                    "--farm-security friends requires --farm-config <wiki-config.json>",
+                );
+                let cfg: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(&path)
+                        .unwrap_or_else(|e| panic!("--farm-config {path:?}: {e}")),
+                )
+                .unwrap_or_else(|e| panic!("--farm-config {path:?}: {e}"));
+                match cfg["cookieSecret"].as_str() {
+                    Some(sec) if !sec.is_empty() => Some(sec.to_string()),
+                    // Refuse rather than fall back to per-boot sessions: a
+                    // farm whose logins silently died on every restart is the
+                    // failure this flag exists to prevent.
+                    _ => panic!("--farm-config {path:?} carries no cookieSecret"),
+                }
+            }
+            Some("oauth2") | Some("social") | None => None,
+            Some(other) => {
+                panic!("unsupported --farm-security {other:?} (friends|hitchhiker|oauth2)")
+            }
         };
         Serving::Farm(Arc::new(Farm {
             root,
@@ -214,6 +255,7 @@ async fn main() {
             neighbors,
             tint,
             oidc: farm_oidc,
+            friends_secret: farm_friends,
             cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         }))
     } else {
@@ -221,12 +263,17 @@ async fn main() {
         // mode selection mirrors the reference CLI: --security_type wins,
         // --security_legacy softens the default stub, else read-only (spec §6.2)
         let mode = match security_type.as_deref() {
-            Some(t) if t.contains("friends") => security::Mode::Friends,
+            // wiki-security-hitchhiker is wiki-security-friends verbatim
+            // plus three middlewares this server does not run (view gate,
+            // terms gate, semindex maintenance 503) — the claim model it
+            // presents on the wire is friends, so a farm config that names
+            // it is accepted as written.
+            Some(t) if t.contains("friends") || t == "hitchhiker" => security::Mode::Friends,
             // "social" is the node module's name for the same mode —
             // accepted so a wiki config can be reused verbatim
             Some("oauth2") | Some("social") => security::Mode::OAuth2,
             Some(other) => {
-                panic!("unsupported security_type {other:?} (friends|oauth2)")
+                panic!("unsupported security_type {other:?} (friends|hitchhiker|oauth2)")
             }
             None if security_legacy => security::Mode::Legacy,
             None => security::Mode::Default,

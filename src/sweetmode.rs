@@ -91,6 +91,9 @@ pub fn route(
         ("GET" | "HEAD", "/") => {
             if query.contains("docs=") || query.contains("doc=") {
                 Some(index_html(site, dist))
+            } else if site.data.join("assets/home/index.html").is_file() {
+                // custom static home page wins, as in classic mode (server.js:979)
+                Some(redirect("/assets/home/index.html".to_string()))
             } else {
                 Some(redirect(format!("/view/{}", site.home)))
             }

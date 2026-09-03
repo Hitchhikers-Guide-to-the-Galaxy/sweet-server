@@ -1775,18 +1775,32 @@ fn serve_file_ranged(path: PathBuf, mime: &str, range: Option<&str>) -> Response
     }
 }
 
+// Text-shaped extensions are served as text/plain so a browser DISPLAYS a
+// plan's .md / .toml / .py / .rs assets instead of downloading them. This is a
+// deliberate divergence from the node reference (text/markdown, application/
+// toml, application/octet-stream for .py) — recorded in CONFORMANCE.md.
 fn guess_mime(path: &str) -> &'static str {
-    match path.rsplit('.').next() {
+    let ext = path.rsplit('.').next().map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
         Some("css") => "text/css",
         Some("js") | Some("mjs") => "text/javascript",
+        Some("map") => "application/json",
         Some("json") => "application/json",
         Some("html") => "text/html",
         Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("wasm") => "application/wasm",
         Some("mp3") => "audio/mpeg",
         Some("woff") => "font/woff",
         Some("woff2") => "font/woff2",
+        Some("md") | Some("markdown") | Some("toml") | Some("txt") | Some("csv") | Some("tsv")
+        | Some("log") | Some("yaml") | Some("yml") | Some("ini") | Some("cfg") | Some("py")
+        | Some("rs") | Some("sh") | Some("coffee") | Some("ts") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }

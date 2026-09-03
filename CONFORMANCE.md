@@ -115,3 +115,16 @@ L5-L7 — the suite boots its own candidates; give it the binary:
 Note `--target-url` and `--candidate-bin` are different modes: a few
 tests need to plant state before boot and so only run under
 `--candidate-bin`.
+
+## Deliberate divergence — asset Content-Type (2026-09-03)
+
+Text-shaped assets (`.md .markdown .toml .txt .csv .tsv .log .yaml .yml .ini
+.cfg .py .rs .sh .coffee .ts`) are served as `text/plain; charset=utf-8` so a
+browser displays them. The node reference (express.static + mime-types) sends
+`text/markdown`, `application/toml`, `application/octet-stream` (.py) and a
+mime-db collision for `.rs` (`application/rls-services+xml`), all of which
+browsers download. No suite test asserts asset Content-Type today; if the
+differential runner ever byte-diffs headers this is a waiver, and the open
+question is whether to record it as a `BUGS.toml` verdict (`asset-text-mime`,
+L0, strict xfail) — David's call, tracked on the File Plugin Plan
+(https://sweet.fedwiki.club/view/file-plugin-plan).

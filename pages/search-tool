@@ -1,0 +1,56 @@
+{
+  "title": "Search from '{{title}}'",
+  "story": [
+    {
+      "type": "paragraph",
+      "id": "s0000000000000001",
+      "text": "Search for pages related to '{{title}}'. Each search on this page finds pages related in a different way. Choose the search of interest. Be patient."
+    },
+    {
+      "type": "paragraph",
+      "id": "s0000000000000002",
+      "text": "Find pages with links to this title."
+    },
+    {
+      "type": "search",
+      "id": "s0000000000000003",
+      "text": "SEARCH LINKS {{slug}}"
+    },
+    {
+      "type": "paragraph",
+      "id": "s0000000000000004",
+      "text": "Find pages with titles similar to this title."
+    },
+    {
+      "type": "search",
+      "id": "s0000000000000005",
+      "text": "SEARCH SLUGS {{slug}}"
+    },
+    {
+      "type": "paragraph",
+      "id": "s0000000000000006",
+      "text": "Find pages neighboring  this site."
+    },
+    {
+      "type": "search",
+      "id": "s0000000000000007",
+      "text": "SEARCH SITES {{site}}"
+    },
+    {
+      "type": "paragraph",
+      "id": "s0000000000000008",
+      "text": "Find pages sharing any of these items."
+    },
+    {
+      "type": "search",
+      "id": "s0000000000000009",
+      "text": "SEARCH ANY ITEMS {{ids}}"
+    },
+    {
+      "type": "markdown",
+      "id": "s000000000000000a",
+      "text": "This page is the site's search tool. Author a page named `search-tool` on this wiki to replace it — the placeholders {{title}}, {{slug}}, {{site}}, {{origin}} and {{ids}} are filled in from the page you searched from."
+    }
+  ],
+  "journal": []
+}

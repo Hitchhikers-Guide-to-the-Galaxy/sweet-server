@@ -9,27 +9,35 @@ tier-agnostic. Counts are candidate-side passes.
 
 | Level | Tier          | Tests      | Status | Date       |
 |-------|---------------|------------|--------|------------|
-| L0    | t0-minimal    | 11         | PASS   | 2026-09-01 |
-| L0    | t1-core-items | 11         | PASS   | 2026-09-01 |
-| L0    | t2-journal    | 11         | PASS   | 2026-09-01 |
-| L1    | t0-minimal    | 16         | PASS   | 2026-09-01 |
-| L1    | t1-core-items | 16         | PASS   | 2026-09-01 |
-| L1    | t2-journal    | 16         | PASS   | 2026-09-01 |
-| L2    | t0-minimal    | 20 (+1 s)  | PASS   | 2026-09-01 |
-| L2    | t1-core-items | 20 (+1 s)  | PASS   | 2026-09-01 |
-| L2    | t2-journal    | 20 (+1 s)  | PASS   | 2026-09-01 |
-| L3    | t0-minimal    | 14         | PASS   | 2026-09-01 |
-| L3    | t1-core-items | 14         | PASS   | 2026-09-01 |
-| L3    | t2-journal    | 14         | PASS   | 2026-09-01 |
-| L4    | t0-minimal    | 11         | PASS   | 2026-09-01 |
-| L4    | t1-core-items | 11         | PASS   | 2026-09-01 |
-| L4    | t2-journal    | 11         | PASS   | 2026-09-01 |
-| L5    | self-booted   | 9 (+1 x)   | PASS   | 2026-09-01 |
-| L6    | self-booted   | 19 (+1 x)  | PASS   | 2026-09-01 |
-| L7    | self-booted   | 105 (+2 s) | PASS   | 2026-09-01 |
+| L0    | t0-minimal    | 11         | PASS   | 2026-09-03 |
+| L0    | t1-core-items | 11         | PASS   | 2026-09-03 |
+| L0    | t2-journal    | 11         | PASS   | 2026-09-03 |
+| L1    | t0-minimal    | 21         | PASS   | 2026-09-03 |
+| L1    | t1-core-items | 21         | PASS   | 2026-09-03 |
+| L1    | t2-journal    | 21         | PASS   | 2026-09-03 |
+| L2    | t0-minimal    | 20 (+1 s)  | PASS   | 2026-09-03 |
+| L2    | t1-core-items | 20 (+1 s)  | PASS   | 2026-09-03 |
+| L2    | t2-journal    | 20 (+1 s)  | PASS   | 2026-09-03 |
+| L3    | t0-minimal    | 14         | PASS   | 2026-09-03 |
+| L3    | t1-core-items | 14         | PASS   | 2026-09-03 |
+| L3    | t2-journal    | 14         | PASS   | 2026-09-03 |
+| L4    | t0-minimal    | 11         | PASS   | 2026-09-03 |
+| L4    | t1-core-items | 11         | PASS   | 2026-09-03 |
+| L4    | t2-journal    | 11         | PASS   | 2026-09-03 |
+| L5    | self-booted   | 13 (+1 x)  | PASS   | 2026-09-03 |
+| L6    | self-booted   | 19 (+1 x)  | PASS   | 2026-09-03 |
+| L7    | self-booted   | 105 (+2 s) | PASS   | 2026-09-03 |
+| EXT   | self-booted   | 7          | PASS   | 2026-09-03 |
 
 `s` = skipped, `x` = xfail on the REFERENCE (a registered spec BUG the
-suite refuses to copy — see BUGS.toml). 210 tests collected in total.
+suite refuses to copy — see BUGS.toml). 226 tests collected in total.
+Reproduce the whole table in one command:
+
+    targets/fedwiki-server/scripts/ratchet-sweep.py
+
+EXT is not a conformance level: it pins sweet-only extensions that have no
+reference to be an oracle, so it is candidate-booted and skips without
+`--candidate-bin`.
 
 ## What each level pinned
 
@@ -37,9 +45,20 @@ suite refuses to copy — see BUGS.toml). 210 tests collected in total.
 (MiniSearch serializationVersion 2 — validated by node loadJSON + live
 client search), /system/export.json, /remote/:site/:slug.json, security
 client statics, Last-Modified on sitemap/site-index (load-bearing for the
-client's neighborhood — found by the Server Lineup Test). Known
-divergence: /:slug.html serves the shell without server-rendered story
-(0.27.0's own story rendering is a spec BUG).
+client's neighborhood — found by the Server Lineup Test).
+
+**L1 EXTENDED (2026-09-03)**: `/:slug.html` is now genuinely generated —
+`data-server-generated=true`, the twins/header/story scaffold, the title
+in an `<h1>`, and every story item rendered with link markup byte-identical
+to `wiki-client/lib/resolve.js` (verified against the client's own
+`resolveLinks` on six cases including marker adulteration and spaced
+slugs). This DIVERGES from the reference deliberately: `server.js:89`
+builds each item div and returns none of them, so its generated story is
+newlines — registered as `static-html-story-discarded`, reference xfails
+strict. Two smaller fixes rode along: the route now 404s for a missing
+page (it answered 200), and `/view/...` is pinned to carry neither the
+marker nor a story, which is what keeps the lineup route honest while the
+generated one moves.
 
 **L2 COMPLETE (2026-08-28)**: six-verb action grammar (form-encoded
 action-as-JSON-string body), implicit fork with journal prepend, fork
@@ -128,3 +147,18 @@ differential runner ever byte-diffs headers this is a waiver, and the open
 question is whether to record it as a `BUGS.toml` verdict (`asset-text-mime`,
 L0, strict xfail) — David's call, tracked on the File Plugin Plan
 (https://sweet.fedwiki.club/view/file-plugin-plan).
+
+**EXT — customisable tool pages (2026-09-03)**: the search panel and the
+page-flag panel are ordinary wiki pages resolved through the existing
+site -> defaults -> plugin fallback (with a built-in fourth rung baked
+into the binary), substituted with `{{title}} {{slug}} {{site}}
+{{origin}} {{ids}}` from the page the tool was opened from, and served at
+`/system/tool/<kind>/<slug>.json`. The client half is `sweet-ux.js`,
+served and injected by the shell sweet writes itself — which is the
+point: a node farm can only get a global client hook by forking its
+security module (`wiki-security-hitchhiker` exists solely so its
+`client/security.js` can inject that tag), and then builds both panels in
+JavaScript, so customising them means editing plugin code. Here it means
+authoring a page. All of it is behind `--tool-pages`: with the flag
+absent the shell is byte-for-byte unchanged and every new route 404s,
+which the first EXT test pins.

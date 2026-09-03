@@ -1,0 +1,46 @@
+{
+  "title": "Tools for '{{title}}'",
+  "story": [
+    {
+      "type": "paragraph",
+      "id": "t0000000000000001",
+      "text": "Ways to look at '{{title}}' and to navigate on from it. This panel opened from the flag on that page."
+    },
+    {
+      "type": "markdown",
+      "id": "t0000000000000002",
+      "text": "## Look at this page\n\n- [{{origin}}/{{slug}}.json its JSON] — the page as the server stores it\n- [{{origin}}/{{slug}}.html a static view] — rendered without the client\n"
+    },
+    {
+      "type": "paragraph",
+      "id": "t0000000000000003",
+      "text": "Find pages that link here."
+    },
+    {
+      "type": "search",
+      "id": "t0000000000000004",
+      "text": "SEARCH LINKS {{slug}}"
+    },
+    {
+      "type": "paragraph",
+      "id": "t0000000000000005",
+      "text": "Find pages with a similar title."
+    },
+    {
+      "type": "search",
+      "id": "t0000000000000006",
+      "text": "SEARCH SLUGS {{slug}}"
+    },
+    {
+      "type": "markdown",
+      "id": "t0000000000000007",
+      "text": "## Navigate\n\n- [[Recent Changes]]\n- [[Changes to this Site]]\n"
+    },
+    {
+      "type": "markdown",
+      "id": "t0000000000000008",
+      "text": "This page is the site's page-tools panel. Author a page named `page-tools` on this wiki to replace it — the placeholders {{title}}, {{slug}}, {{site}}, {{origin}} and {{ids}} are filled in from the page whose flag was clicked."
+    }
+  ],
+  "journal": []
+}

@@ -30,10 +30,12 @@ mod assets;
 mod indexes;
 mod oidc;
 mod plugmatic;
+mod render;
 mod shortlink;
 mod sidecar;
 mod table;
 mod search;
+mod tools;
 mod security;
 mod sweetmode;
 
@@ -61,6 +63,10 @@ struct Site {
     tint: Option<String>,
     /// Mode::OAuth2 only: the OIDC flow state (see oidc.rs)
     oidc: Option<Arc<oidc::Oidc>>,
+    /// --tool-pages: the customisable search / page-actions tool pages
+    /// (tools.rs). Off by default, so the shell and /system/tool/ stay
+    /// exactly as they were.
+    tools: tools::Config,
     /// --url: the site's own absolute URL, the reference's argv.url —
     /// context for the fedwiki.api door (api.json servers block, handler
     /// context). Default mirrors defaultargs: http://localhost:<port>.
@@ -95,6 +101,7 @@ struct Farm {
     /// stateless so a restart does not sign the operator out of every site
     /// at once.
     friends_secret: Option<String>,
+    tools: tools::Config,
     cache: std::sync::RwLock<std::collections::HashMap<String, Arc<Site>>>,
 }
 
@@ -146,6 +153,7 @@ impl Farm {
             page_cache: Default::default(),
             tint: self.tint.clone(),
             oidc: self.oidc.clone(),
+            tools: self.tools.clone(),
             url: format!("http://{host}"),
         });
         self.cache.write().unwrap().insert(name, site.clone());
@@ -179,6 +187,9 @@ async fn main() {
     // --oidc-config: a mode-600 file, so the secret is never in argv.
     let mut farm_config: Option<PathBuf> = None;
     let mut url: Option<String> = None;
+    let mut tool_pages = false;
+    let mut search_page: Option<String> = None;
+    let mut tools_page: Option<String> = None;
     let mut farm_prefix = "sweet-".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -204,6 +215,11 @@ async fn main() {
             "--farm-security" => farm_security = args.next(),
             "--farm-config" => farm_config = args.next().map(PathBuf::from),
             "--url" => url = args.next(),
+            // the customisable tool pages (tools.rs); opt-in, so a site that
+            // does not ask for them serves exactly what it served before
+            "--tool-pages" => tool_pages = true,
+            "--search-page" => search_page = args.next(),
+            "--tools-page" => tools_page = args.next(),
             "--farm-prefix" => {
                 if let Some(p) = args.next() {
                     farm_prefix = p;
@@ -212,6 +228,11 @@ async fn main() {
             _ => {}
         }
     }
+    let tool_config = tools::Config {
+        enabled: tool_pages,
+        search: search_page,
+        page: tools_page,
+    };
     let serving = if let Some(root) = farm {
         let farm_oidc = match farm_security.as_deref() {
             Some("oauth2") | Some("social") => {
@@ -259,6 +280,7 @@ async fn main() {
             tint,
             oidc: farm_oidc,
             friends_secret: farm_friends,
+            tools: tool_config,
             cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         }))
     } else {
@@ -308,6 +330,7 @@ async fn main() {
             page_cache: Default::default(),
             tint,
             oidc,
+            tools: tool_config,
             url: url.unwrap_or_else(|| format!("http://localhost:{port}")),
         }))
     };
@@ -993,6 +1016,30 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
             }
             cors_json(Value::Object(map))
         }
+        "/system/sweet-ux.js" if site.tools.enabled => Response::builder()
+            .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+            .body(Body::from(tools::SCRIPT))
+            .unwrap(),
+        // Customisable tool pages: /system/tool/<kind>/<slug>.json — the
+        // template resolved through the ordinary page fallback and handed to
+        // the client as a ghost page (tools.rs). Read-only by construction:
+        // it opens files and writes nothing, per the farm-autovivify lesson.
+        // Gated, so with --tool-pages absent this path 404s as it always has.
+        p if site.tools.enabled
+            && p.starts_with("/system/tool/")
+            && p.ends_with(".json") =>
+        {
+            let rest = &p["/system/tool/".len()..p.len() - 5];
+            match rest.split_once('/') {
+                Some((kind, from)) => {
+                    match tools::resolve(site, kind, from, &auth.host, &auth.proto) {
+                        Some(page) => cors_json(page),
+                        None => not_found("Page not found"),
+                    }
+                }
+                None => not_found("Page not found"),
+            }
+        }
         p if p.starts_with("/remote/") => remote_proxy(p),
         // recycler reads ride the same authorized middleware as writes
         // (server.js:577,582,617)
@@ -1070,13 +1117,27 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
             page_json_conditional(site, &p[1..p.len() - 5], auth.if_none_match.as_deref())
         }
         p if p.ends_with(".html") && !p[1..].contains('/') => {
-            shell(site, &[("view".into(), p[1..p.len() - 5].to_string())], auth)
+            // server.js:407 reads the page first and 404s when it is missing;
+            // the page it finds is rendered into the shell (data-server-generated).
+            let slug = p[1..p.len() - 5].to_string();
+            match load_page(site, &slug)
+                .or_else(|| load_plugin_page(site, &slug))
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            {
+                Some(mut page) => {
+                    if page["title"].as_str().unwrap_or("").is_empty() {
+                        page["title"] = Value::String(slug.replace('-', " "));
+                    }
+                    shell(site, &[("view".into(), slug)], auth, Some(&page))
+                }
+                None => not_found("Page not found"),
+            }
         }
         p => {
             // lineup URLs: alternating /loc/slug pairs, e.g.
             // /view/welcome-visitors/localhost:4251/some-page (server.js:371)
             if let Some(pairs) = parse_lineup(p) {
-                return shell(site, &pairs, auth);
+                return shell(site, &pairs, auth, None);
             }
             // wiki-client statics mounted at / (client.js, style/, js/, images/)
             if let Some(client) = client_dir(site) {
@@ -1152,13 +1213,19 @@ fn parse_lineup(path: &str) -> Option<Vec<(String, String)>> {
 
 /// The static.html shell (wiki-client/views/static.html) with the page divs
 /// interpolated — the client boots from here and fetches page JSON itself.
-fn shell(site: &Site, pairs: &[(String, String)], auth: Auth) -> Response {
+fn shell(
+    site: &Site,
+    pairs: &[(String, String)],
+    auth: Auth,
+    generated: Option<&Value>,
+) -> Response {
     if client_dir(site).is_none() {
         return not_found("Page not found"); // no vendor: read-only JSON server
     }
-    let title = pairs
-        .last()
-        .map(|(_, s)| s.replace('-', " "))
+    let title = generated
+        .and_then(|p| p["title"].as_str())
+        .map(str::to_string)
+        .or_else(|| pairs.last().map(|(_, s)| s.replace('-', " ")))
         .unwrap_or_default();
     let owner = site.security.owner_name();
     let divs: String = pairs
@@ -1169,9 +1236,23 @@ fn shell(site: &Site, pairs: &[(String, String)], auth: Auth) -> Response {
             } else {
                 format!(" data-site={loc}")
             };
-            format!(
-                "      <div class='page' id='{slug}' tabindex=\"-1\"{origin}>\n        <div class='paper'>\n        </div>\n      </div>\n"
-            )
+            // The generated route (server.js:407) renders the story into the
+            // paper and marks the div; the lineup route (server.js:371) never
+            // does — it passes {page} alone and lets the client fetch. Keeping
+            // the lineup arm byte-for-byte as it shipped is what holds the
+            // /view/ parity the suite already pins.
+            match generated {
+                Some(page) => {
+                    let title = page["title"].as_str().unwrap_or(slug);
+                    format!(
+                        "      <div class='page' id='{slug}' tabindex=\"-1\"{origin} data-server-generated=true>\n        <div class='paper'>\n          {}\n        </div>\n      </div>\n",
+                        render::render_story(page, title)
+                    )
+                }
+                None => format!(
+                    "      <div class='page' id='{slug}' tabindex=\"-1\"{origin}>\n        <div class='paper'>\n        </div>\n      </div>\n"
+                ),
+            }
         })
         .collect();
     let owner_footer = owner
@@ -1179,6 +1260,15 @@ fn shell(site: &Site, pairs: &[(String, String)], auth: Auth) -> Response {
         .map(|n| format!("Wiki by: <span id='site-owner'>{n}</span></div>"))
         .unwrap_or_default();
     let owned = owner.is_some();
+    // The tool-page client, carried by the shell itself. A node farm has to
+    // fork its security module to get a tag here; sweet writes the shell, so
+    // it simply adds one — and only when --tool-pages asked for it, which is
+    // what keeps the default shell byte-for-byte what it always was.
+    let ux = if site.tools.enabled {
+        "\n    <script src='/system/sweet-ux.js' type='text/javascript'></script>"
+    } else {
+        ""
+    };
     // the script block mirrors static.html's mustache output exactly:
     // var isOwner = ('{{isOwner}}' === "true") with booleans rendered as
     // "true"/"false" strings. isOwner must be truthful (server.js:392) —
@@ -1201,7 +1291,7 @@ fn shell(site: &Site, pairs: &[(String, String)], auth: Auth) -> Response {
     <script src='/js/jquery-ui/1.14.2/jquery-ui.min.js' type='text/javascript'></script>
     <script src='/js/jquery.ui.touch-punch.min.js' type='text/javascript'></script>
     <script src='/js/underscore-min.js' type='text/javascript'></script>
-    <script src='/client.js' type='text/javascript'></script>
+    <script src='/client.js' type='text/javascript'></script>{ux}
   </head>
   <body>
     <section class='main'>
@@ -1544,7 +1634,7 @@ fn links(page: &Value) -> Value {
     Value::Object(map)
 }
 
-fn as_slug(title: &str) -> String {
+pub(crate) fn as_slug(title: &str) -> String {
     title
         .chars()
         .map(|c| if c.is_whitespace() { '-' } else { c })

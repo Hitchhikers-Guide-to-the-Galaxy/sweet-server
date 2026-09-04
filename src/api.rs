@@ -30,8 +30,8 @@ const METHODS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
 /// declared path lands on one of these; everything else is excluded and
 /// recorded in `skipped`, because the plugin's own Node server does not
 /// run here and sweet ships no forwarder, by decision.
-const NATIVE_PLUGIN_ROUTES: [&str; 4] =
-    ["/plugin/assets/", "/plugin/plugmatic/", "/plugin/shortlink/", "/plugin/table/"];
+const NATIVE_PLUGIN_ROUTES: [&str; 5] =
+    ["/plugin/assets/", "/plugin/plugmatic/", "/plugin/shortlink/", "/plugin/table/", "/plugin/oneclick/"];
 
 fn natively_served(declared_path: &str) -> bool {
     NATIVE_PLUGIN_ROUTES

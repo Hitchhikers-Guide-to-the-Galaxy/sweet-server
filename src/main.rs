@@ -29,6 +29,7 @@ mod api;
 mod assets;
 mod indexes;
 mod oidc;
+mod oneclick;
 mod plugmatic;
 mod render;
 mod shortlink;
@@ -587,6 +588,20 @@ async fn main() {
                         ) {
                             Some(resp) => resp,
                             None => write_route(&site, method.as_str(), &path, &body, authorized),
+                        }
+                    }
+                    // One Click Orgs, rewilded (oneclick.rs) — an organisation
+                    // is a site; reads fold its pages, commands journal the diff
+                    ("GET" | "HEAD", p) if p.starts_with("/plugin/oneclick/") => {
+                        match oneclick::get_route(&site, p) {
+                            Some(resp) => resp,
+                            None => route(&site, &path, auth),
+                        }
+                    }
+                    ("POST", p) if p.starts_with("/plugin/oneclick/") => {
+                        match oneclick::post_route(&site, p, &body, authorized) {
+                            Some(resp) => resp,
+                            None => not_found("Page not found"),
                         }
                     }
                     ("GET" | "HEAD", _) => route(&site, &path, auth),

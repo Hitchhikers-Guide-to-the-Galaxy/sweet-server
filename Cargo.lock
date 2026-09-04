@@ -1135,6 +1135,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "oneclick-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "openidconnect"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1886,6 +1894,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac",
  "multer",
+ "oneclick-core",
  "openidconnect",
  "regex",
  "serde_json",

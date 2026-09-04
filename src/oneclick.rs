@@ -12,6 +12,7 @@
 //!   GET  /plugin/oneclick/proposals.json         every proposal with its tally
 //!   GET  /plugin/oneclick/proposal/<slug>.json   one proposal, its votes and its system
 //!   GET  /plugin/oneclick/decisions.json
+//!   GET  /plugin/oneclick/fca.json               a co-op's registration-form rule numbers (D2)
 //!   GET  /plugin/oneclick/voting-systems.json    the B0 table, from the candidate's own rules
 //!   GET  /plugin/oneclick/lifecycles.json        the B1-B3 table
 //!   POST /plugin/oneclick/command                {command, actor, ...} — owner-authorised
@@ -103,8 +104,15 @@ fn proposal_state(s: ProposalState) -> &'static str {
     match s { ProposalState::Open => "open", ProposalState::Accepted => "accepted", ProposalState::Rejected => "rejected" }
 }
 
+/// The document for the organisation's kind: the association constitution, or the co-op
+/// Rules through the Rticles port. A company has no template in the reference (its
+/// articles are held externally), so it renders nothing.
 fn constitution_html(org: &Organisation, domain: &str) -> Option<String> {
-    AssociationConstitution::from_org(org, domain).map(|c| render(&c))
+    match org.kind {
+        oneclick_core::org::Kind::Association => AssociationConstitution::from_org(org, domain).map(|c| render(&c)),
+        oneclick_core::org::Kind::Coop => oneclick_core::render::coop_rules_html(org).ok(),
+        oneclick_core::org::Kind::Company => None,
+    }
 }
 
 fn proposal_json(org: &Organisation, p: &oneclick_core::proposals::Proposal, now: i64) -> Value {
@@ -153,6 +161,7 @@ pub fn get_route(site: &Site, path: &str) -> Option<Response> {
         "members.json" => json(StatusCode::OK, json!({
             "name": org.name(), "kind": org.kind.as_str(), "state": state_str(org.state),
             "can_hold_founding_vote": org.can_hold_founding_vote(),
+            "coop_can_propose": org.coop_can_propose(),
             "founding_vote_open": org.founding_proposal().map(|p| p.is_open()).unwrap_or(false),
             "member_classes": org.member_classes,
             "members": org.members.iter().map(|m| json!({
@@ -167,6 +176,13 @@ pub fn get_route(site: &Site, path: &str) -> Option<Response> {
             "proposals": org.proposals.iter().rev().map(|p| proposal_json(&org, p, now)).collect::<Vec<_>>(),
         })),
         "decisions.json" => json(StatusCode::OK, json!({"decisions": org.decisions})),
+        "fca.json" => match org.kind {
+            oneclick_core::org::Kind::Coop => match oneclick_core::render::coop_fca_map(&org) {
+                Ok(m) => json(StatusCode::OK, m),
+                Err(e) => json(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
+            },
+            _ => json(StatusCode::NOT_FOUND, json!({"error": "only a co-op has a registration form"})),
+        },
         "voting-systems.json" => json(StatusCode::OK, oneclick_core::tables::voting_systems()),
         "lifecycles.json" => json(StatusCode::OK, oneclick_core::tables::lifecycles()),
         "state.json" => json(StatusCode::OK, serde_json::to_value(&org).unwrap_or(Value::Null)),
@@ -268,6 +284,12 @@ pub fn post_route(site: &Site, path: &str, body: &[u8], authorized: bool) -> Opt
             org.member_event(field(&req, "email"), ev, now)
         }
         "close" => Ok(()),
+        // the co-op's founding path: appoint classes while pending, propose when it can,
+        // and the registrar's agent founds it (admin/coops_controller#found)
+        "set-class" => org.set_member_class(field(&req, "email"), field(&req, "member_class")),
+        "admit" => org.admit(field(&req, "email"), field(&req, "first_name"), field(&req, "last_name"), if field(&req, "member_class").is_empty() { "Member" } else { field(&req, "member_class") }, now),
+        "coop-propose" => org.coop_propose(),
+        "coop-found" => org.coop_found(),
         _ => return Some(json(StatusCode::BAD_REQUEST, json!({"error": format!("unknown command {command}")}))),
     };
     if let Err(e) = outcome {

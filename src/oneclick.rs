@@ -148,6 +148,7 @@ pub fn get_route(site: &Site, path: &str) -> Option<Response> {
             "name": org.name(), "kind": org.kind.as_str(), "state": state_str(org.state),
             "updated_at": org.constitution_updated_at(), "domain": domain,
             "html": constitution_html(&org, &domain),
+            "articles_url": org.clauses.get_text("articles_url"),
             "clauses": org.clauses.iter().map(|(n, v)| (n.clone(), serde_json::to_value(v).unwrap())).collect::<serde_json::Map<_, _>>(),
             "voting_period": org.voting_period(),
             "selectable_systems": oneclick_core::voting::SELECTABLE.iter().map(|s| json!({"name": s.name(), "description": s.description()})).collect::<Vec<_>>(),
@@ -167,7 +168,8 @@ pub fn get_route(site: &Site, path: &str) -> Option<Response> {
             "members": org.members.iter().map(|m| json!({
                 "email": m.email, "first_name": m.first_name, "last_name": m.last_name, "name": m.name(),
                 "member_class": m.member_class, "state": m.state.as_str(), "created_at": m.created_at,
-                "inducted_at": m.inducted_at, "transitions": m.transitions,
+                "inducted_at": m.inducted_at, "elected_on": m.elected_on, "stood_down_on": m.stood_down_on,
+                "transitions": m.transitions,
                 "can_vote": org.has_permission(m, "vote"),
             })).collect::<Vec<_>>(),
         })),
@@ -289,6 +291,16 @@ pub fn post_route(site: &Site, path: &str, body: &[u8], authorized: bool) -> Opt
         "set-class" => org.set_member_class(field(&req, "email"), field(&req, "member_class")),
         "admit" => org.admit(field(&req, "email"), field(&req, "first_name"), field(&req, "last_name"), if field(&req, "member_class").is_empty() { "Member" } else { field(&req, "member_class") }, now),
         "coop-propose" => org.coop_propose(),
+        // the company's doors (directors_controller, members_controller#update)
+        "add-director" => {
+            if !(req["certification"].as_bool().unwrap_or(false) && req["age_certification"].as_bool().unwrap_or(false)) {
+                return Some(json(StatusCode::UNPROCESSABLE_ENTITY, json!({"error": "a director must accept both certifications"})));
+            }
+            org.add_director(field(&req, "email"), field(&req, "first_name"), field(&req, "last_name"), now)
+        }
+        "stand-down" => org.stand_down(field(&req, "email"), now),
+        "edit-profile" => org.edit_profile(field(&req, "email"), field(&req, "first_name"), field(&req, "last_name")),
+        "set-articles-url" => org.set_articles_url(field(&req, "url"), now),
         "coop-found" => org.coop_found(),
         _ => return Some(json(StatusCode::BAD_REQUEST, json!({"error": format!("unknown command {command}")}))),
     };

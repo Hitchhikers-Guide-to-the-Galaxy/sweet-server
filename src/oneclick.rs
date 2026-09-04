@@ -16,6 +16,9 @@
 //!   GET  /plugin/oneclick/voting-systems.json    the B0 table, from the candidate's own rules
 //!   GET  /plugin/oneclick/lifecycles.json        the B1-B3 table
 //!   POST /plugin/oneclick/command                {command, actor, ...} — owner-authorised
+//!        commands: propose, found, vote, add-founding-member, member-event, set-class, admit,
+//!        coop-propose, coop-found, add-director, stand-down, edit-profile, set-articles-url,
+//!        adopt-audit-committee, set-group, appoint-representative, audit (approve|block)
 //!   POST /plugin/oneclick/close                  close due and early-closable proposals (the
 //!                                                reference's 60-second job, run on demand)
 //!
@@ -101,7 +104,7 @@ fn state_str(s: OrgState) -> &'static str {
 }
 
 fn proposal_state(s: ProposalState) -> &'static str {
-    match s { ProposalState::Open => "open", ProposalState::Accepted => "accepted", ProposalState::Rejected => "rejected" }
+    match s { ProposalState::Open => "open", ProposalState::Accepted => "accepted", ProposalState::Rejected => "rejected", ProposalState::UnderAudit => "under_audit", ProposalState::Blocked => "blocked" }
 }
 
 /// The document for the organisation's kind: the association constitution, or the co-op
@@ -130,6 +133,9 @@ fn proposal_json(org: &Organisation, p: &oneclick_core::proposals::Proposal, now
         "passing": system.map(|s| s.passed(&tally)),
         "can_close_early": system.map(|s| s.can_be_closed_early(&tally)),
         "votes": p.votes,
+        "special": p.is_special(),
+        "audit": p.audit,
+        "seats": org.seats,
     })
 }
 
@@ -163,18 +169,23 @@ pub fn get_route(site: &Site, path: &str) -> Option<Response> {
             "name": org.name(), "kind": org.kind.as_str(), "state": state_str(org.state),
             "can_hold_founding_vote": org.can_hold_founding_vote(),
             "coop_can_propose": org.coop_can_propose(),
+            "audit_committee": org.clauses.get_boolean("audit_committee"),
+            "enabled_groups": org.enabled_groups(),
+            "seats": org.seats,
             "founding_vote_open": org.founding_proposal().map(|p| p.is_open()).unwrap_or(false),
             "member_classes": org.member_classes,
             "members": org.members.iter().map(|m| json!({
                 "email": m.email, "first_name": m.first_name, "last_name": m.last_name, "name": m.name(),
                 "member_class": m.member_class, "state": m.state.as_str(), "created_at": m.created_at,
+                "stakeholder_group": m.stakeholder_group,
                 "inducted_at": m.inducted_at, "elected_on": m.elected_on, "stood_down_on": m.stood_down_on,
                 "transitions": m.transitions,
                 "can_vote": org.has_permission(m, "vote"),
             })).collect::<Vec<_>>(),
         })),
         "proposals.json" => json(StatusCode::OK, json!({
-            "state": state_str(org.state),
+            "state": state_str(org.state), "kind": org.kind.as_str(),
+            "audit_committee": org.clauses.get_boolean("audit_committee"), "enabled_groups": org.enabled_groups(),
             "proposals": org.proposals.iter().rev().map(|p| proposal_json(&org, p, now)).collect::<Vec<_>>(),
         })),
         "decisions.json" => json(StatusCode::OK, json!({"decisions": org.decisions})),
@@ -301,6 +312,11 @@ pub fn post_route(site: &Site, path: &str, body: &[u8], authorized: bool) -> Opt
         "stand-down" => org.stand_down(field(&req, "email"), now),
         "edit-profile" => org.edit_profile(field(&req, "email"), field(&req, "first_name"), field(&req, "last_name")),
         "set-articles-url" => org.set_articles_url(field(&req, "url"), now),
+        // the multi-stakeholder audit committee (audit.rs; Audit Committee Plan)
+        "adopt-audit-committee" => org.adopt_audit_committee(req["adopt"].as_bool().unwrap_or(true), now),
+        "set-group" => org.set_stakeholder_group(field(&req, "email"), field(&req, "group")),
+        "appoint-representative" => org.appoint_representative(field(&req, "group"), field(&req, "email")),
+        "audit" => org.audit_decision(field(&req, "slug"), &actor, req["approve"].as_bool().unwrap_or(false), now).map(|st| { result = json!({"audit": st}); }),
         "coop-found" => org.coop_found(),
         _ => return Some(json(StatusCode::BAD_REQUEST, json!({"error": format!("unknown command {command}")}))),
     };

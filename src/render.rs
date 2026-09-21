@@ -157,3 +157,39 @@ pub fn render_story(page: &Value, title: &str) -> String {
         items.join("\n")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Regression for the 2026-09-10 Cafe farm outage: node's resolveLinks
+    /// guards with `(text || "")`, so a truthy non-string `text` (the integer
+    /// 2010 on david.hitchhiker.academy/opinionated-wiki) threw uncaught on a
+    /// crawler's `/<slug>.html` and killed every domain on the box. Malformed
+    /// story data must render as empty text here, never panic.
+    #[test]
+    fn malformed_story_items_render_without_panicking() {
+        let page = json!({"story": [
+            {"type": "image", "text": 2010, "url": "/x.jpg"},
+            {"type": "paragraph", "text": 2010},
+            {"type": "paragraph", "text": true},
+            {"type": "html", "text": {"x": 1}},
+            {"type": "markdown", "text": [1, 2]},
+            {"type": "paragraph", "text": null},
+            {"type": 7},
+            null, 7, "str"
+        ]});
+        let html = render_story(&page, "Opinionated Wiki");
+        assert!(html.contains("uploaded image"));
+        assert!(!html.contains("2010"));
+    }
+
+    #[test]
+    fn non_array_story_renders_empty() {
+        for story in [json!(null), json!({"a": 1}), json!("s"), json!(5)] {
+            let html = render_story(&json!({ "story": story }), "t");
+            assert!(html.contains("<div class=\"story\"></div>"));
+        }
+    }
+}

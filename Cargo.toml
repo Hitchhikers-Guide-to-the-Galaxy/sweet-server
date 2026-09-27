@@ -21,6 +21,7 @@ sha2 = "0.10"
 base64 = "0.21"
 sha1 = "0.10"
 oneclick-core = { path = "../oneclick-orgs/core" }
+similarity-core = { path = "../similarity-core" }
 
 [profile.release]
 strip = true

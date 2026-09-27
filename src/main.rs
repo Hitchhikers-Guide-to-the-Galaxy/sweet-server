@@ -33,6 +33,7 @@ mod oneclick;
 mod plugmatic;
 mod render;
 mod shortlink;
+mod similarity;
 mod sidecar;
 mod table;
 mod search;
@@ -336,6 +337,13 @@ async fn main() {
         }))
     };
     let serving = Arc::new(serving);
+    // similarity routes (similarity.rs): the farm's restricted sites come
+    // from --farm-config; a farm warms its vector store now, not on the
+    // first query, as the plugin's startServer does
+    similarity::set_farm_config(farm_config.clone());
+    if let Serving::Farm(farm) = serving.as_ref() {
+        similarity::for_farm(&farm.root, farm.vendor.as_deref());
+    }
     // the fedwiki.api door: built lazily on first use, only when the
     // vendor carries wiki-plugin-farm (parity: no farm plugin, no door)
     let api_state: Arc<std::sync::OnceLock<Option<Arc<api::Api>>>> =
@@ -370,6 +378,7 @@ async fn main() {
                 let content_type = header_str(&req, header::CONTENT_TYPE);
                 let accept = header_str(&req, header::ACCEPT);
                 let if_none_match = header_str(&req, header::IF_NONE_MATCH);
+                let if_modified_since = header_str(&req, header::IF_MODIFIED_SINCE);
                 let range = header_str(&req, header::RANGE);
                 let xff = header_str(
                     &req,
@@ -432,6 +441,30 @@ async fn main() {
                     if_none_match,
                     range,
                 };
+                // the similarity routes, native (similarity.rs + the
+                // similarity-core crate); unported ones fall through
+                if path.starts_with("/system/") {
+                    let caller = similarity_core::Caller {
+                        remote_ip: remote_ip.clone(),
+                        forwarded_for: xff.clone(),
+                        origin: auth.origin.clone(),
+                        host: req_host.clone(),
+                        // trust.js trustedSession: an authorised session
+                        // counts only on a site that has an owner file
+                        session_trusted: auth.authorized
+                            && site.data.join("status/owner.json").is_file(),
+                    };
+                    let inc = similarity::Incoming {
+                        method: method.as_str(),
+                        path: &path,
+                        query: &query,
+                        if_modified_since: if_modified_since.as_deref(),
+                        caller,
+                    };
+                    if let Some(resp) = similarity::route(&site.data, site.vendor.as_deref(), &inc) {
+                        return resp;
+                    }
+                }
                 // an api operation whose body is a file is streamed to disk
                 // rather than buffered (farm 0.9.0) — decided before the
                 // body is read, since reading it is what the stream replaces

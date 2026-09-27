@@ -1079,21 +1079,113 @@ fn coerce(raw: Option<&str>, schema: &Value) -> Option<Value> {
     }
 }
 
-/// mount.js argumentsFor + missingRequired. Query is the raw query string.
+/// mount.js takesBinaryBody (farm 0.9.0) — an operation whose body is a
+/// file. Such a body is never parsed: it is streamed to a temporary file
+/// and the handler is told where (main.rs receive_body).
+pub fn takes_binary_body(op: &Value) -> bool {
+    op["requestBody"]["content"]
+        .as_object()
+        .map(|c| {
+            c.keys()
+                .any(|t| t == "application/octet-stream" || t.ends_with("/*"))
+        })
+        .unwrap_or(false)
+}
+
+/// mount.js bodyLimit — the operator's setting, else the operation's own,
+/// else 500 MB.
+pub fn body_limit(op: &Value) -> u64 {
+    std::env::var("FARM_API_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .or_else(|| op["x-fedwiki-max-bytes"].as_u64())
+        .unwrap_or(500 * 1024 * 1024)
+}
+
+/// mount.js bodyParameters (farm 0.9.0) — a JSON request body's fields,
+/// read as parameters under the same default/coerce/required rules as a
+/// query parameter.
+fn body_parameters(op: &Value) -> Vec<(String, Value, bool)> {
+    let schema = &op["requestBody"]["content"]["application/json"]["schema"];
+    let Some(props) = schema["properties"].as_object() else {
+        return Vec::new();
+    };
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_str())
+        .collect();
+    props
+        .iter()
+        .map(|(name, s)| (name.clone(), s.clone(), required.contains(&name.as_str())))
+        .collect()
+}
+
+/// A body field through coerce: strings exactly as a query value would be;
+/// values already typed by JSON pass through. (Recorded divergence: the
+/// reference's coerce would turn a JSON `true` into false for a boolean.)
+fn coerce_body(raw: &Value, schema: &Value) -> Option<Value> {
+    match raw {
+        Value::Null => None,
+        Value::String(s) => coerce(Some(s), schema),
+        other => Some(other.clone()),
+    }
+}
+
+/// mount.js argumentsFor + missingRequired. Query is the raw query string;
+/// `body` is the parsed JSON body, whose fields win over the query's
+/// (`{ ...req.query, ...req.body }`).
 pub fn arguments_for(
     op: &Value,
     query: &str,
+    body: Option<&Value>,
     ctx: &SiteContext,
 ) -> Result<Value, (u16, String)> {
     let q: std::collections::HashMap<String, String> = crate::oidc::url_query_pairs(query);
     let mut args = Map::new();
     let mut missing = Vec::new();
+    let body_params = body_parameters(op);
+    // the reference merges the body only for an operation that declares one
+    let from_body = body
+        .filter(|b| b.is_object())
+        .filter(|_| !body_params.is_empty());
+    for (name, schema, required) in body_params {
+        let raw = from_body.map(|b| &b[&name]).filter(|v| !v.is_null());
+        let coerced = match raw {
+            Some(v) => coerce_body(v, &schema),
+            None => coerce(q.get(&name).map(String::as_str), &schema),
+        };
+        match coerced {
+            Some(v) => {
+                if v.as_str() == Some("") && required {
+                    missing.push(name);
+                } else {
+                    args.insert(name, v);
+                }
+            }
+            None => {
+                if !schema["default"].is_null() {
+                    args.insert(name, schema["default"].clone());
+                } else if required {
+                    missing.push(name);
+                }
+            }
+        }
+    }
     for p in op["parameters"].as_array().into_iter().flatten() {
         if p["in"] != "query" {
             continue;
         }
         let Some(name) = p["name"].as_str() else { continue };
-        let coerced = coerce(q.get(name).map(String::as_str), &p["schema"]);
+        let raw = from_body
+            .and_then(|b| b.get(name))
+            .filter(|v| !v.is_null());
+        let coerced = match raw {
+            Some(v) => coerce_body(v, &p["schema"]),
+            None => coerce(q.get(name).map(String::as_str), &p["schema"]),
+        };
         match coerced {
             Some(v) => {
                 let empty = v.as_str() == Some("");
@@ -1130,13 +1222,25 @@ pub fn arguments_for(
 }
 
 impl Mounted {
+    /// `body` is the parsed JSON body; `file` is what only the route can
+    /// know — the temporary file a binary body was streamed into. It is
+    /// kept apart from caller-supplied values so no caller can name a path.
     pub fn call(
         &self,
         api: &Api,
         query: &str,
+        body: Option<&Value>,
+        file: Option<&Value>,
         ctx: &SiteContext,
     ) -> Result<Value, (u16, String)> {
-        let args = arguments_for(&self.op, query, ctx)?;
+        let binary = takes_binary_body(&self.op);
+        if binary && file.is_none() {
+            return Err((400, "this operation takes a file as its request body, so it can only be called over HTTP".into()));
+        }
+        let mut args = arguments_for(&self.op, query, body, ctx)?;
+        if let (true, Some(f), Some(obj)) = (binary, file, args.as_object_mut()) {
+            obj.insert("body".into(), f.clone());
+        }
         // shortlink's expand shares the native resolver's failure breaker
         // (one breaker, not two — the reference reaches one singleton
         // through the CJS require cache), so it is answered natively
@@ -1304,7 +1408,8 @@ pub fn handle_mcp(
             // the shared argument path expects
             let args = &message["params"]["arguments"];
             let query = mcp_args_to_query(args);
-            match entry.call(api, &query, ctx) {
+            // body parameters are read from the typed arguments directly
+            match entry.call(api, &query, Some(args), None, ctx) {
                 Ok(value) => Some(rpc_result(id, json!({
                     "content": [{"type": "text",
                                  "text": serde_json::to_string_pretty(&value).unwrap_or_default()}],
@@ -1574,7 +1679,7 @@ pub fn try_operation(
             format!("?{query}")
         }
     );
-    match entry.call(api, &query, ctx) {
+    match entry.call(api, &query, None, None, ctx) {
         Ok(result) => render_answer(&wanted, &operation, &result, &asked),
         Err((status, msg)) => render_problem(
             "That did not work",

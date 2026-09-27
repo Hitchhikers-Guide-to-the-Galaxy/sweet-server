@@ -19,6 +19,18 @@ use std::time::{Duration, Instant};
 
 const HOST_JS: &str = include_str!("sidecar_host.js");
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// CALL_TIMEOUT unless the operator sets SWEET_SIDECAR_TIMEOUT_SECS — a
+/// farm whose handlers ask a model to write (audionote's summarise) needs
+/// longer than a lookup does.
+fn call_timeout() -> Duration {
+    std::env::var("SWEET_SIDECAR_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(CALL_TIMEOUT)
+}
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
 
 pub struct Sidecar {
@@ -99,7 +111,7 @@ impl Sidecar {
         }
         // sequential host: the next line is our answer. Reads happen on a
         // helper thread so a hung handler cannot hang the server.
-        let deadline = Instant::now() + CALL_TIMEOUT;
+        let deadline = Instant::now() + call_timeout();
         let mut buf = String::new();
         loop {
             buf.clear();
@@ -130,7 +142,7 @@ impl Sidecar {
                     return Err(format!(
                         "call timed out after {}s — the handler was killed \
                          (sweet divergence: the reference waits forever)",
-                        CALL_TIMEOUT.as_secs()
+                        call_timeout().as_secs()
                     ));
                 }
                 ReadOutcome::Eof => {

@@ -405,9 +405,6 @@ async fn main() {
                         }
                     }
                 };
-                let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
-                    .await
-                    .unwrap_or_default();
                 // oauth2: one signed-cookie decode per request; the
                 // identity is farm-wide, authorisation stays per-site
                 let oauth2_identity = site
@@ -435,6 +432,32 @@ async fn main() {
                     if_none_match,
                     range,
                 };
+                // an api operation whose body is a file is streamed to disk
+                // rather than buffered (farm 0.9.0) — decided before the
+                // body is read, since reading it is what the stream replaces
+                if path.starts_with("/system/api/") && method != axum::http::Method::GET {
+                    let state = api_state.get_or_init(|| {
+                        api_vendor
+                            .as_ref()
+                            .filter(|v| v.join("wiki-plugin-farm").is_dir())
+                            .map(|v| Arc::new(api::Api::build(v, port)))
+                    });
+                    if let Some(api) = state {
+                        if let Some(entry) = api
+                            .find(method.as_str(), &path)
+                            .filter(|e| api::takes_binary_body(&e.op))
+                        {
+                            return api_binary_route(
+                                api, entry, &site, &query, content_type.as_deref(),
+                                req.into_body(), &auth, port,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
                 // sweet-client mode answers shell/app/api paths first; the
                 // wiki API below keeps serving either way
                 if let Some(resp) =
@@ -852,46 +875,149 @@ fn api_route(
         }
         _ => {
             let entry = api.find(method, path)?;
-            if entry.writes() {
-                // key -> place -> person: a valid key short-circuits the rest
-                let scope = format!("{}.{}", entry.short, entry.op_id);
-                let key_holder = api::authorize_key(
-                    Path::new(&ctx.status),
-                    auth.api_key.as_deref(),
-                    &scope,
-                );
-                if key_holder.is_none() {
-                if let Some((status, msg)) = api::write_refusal(&ctx.origin, auth.authorized)
-                {
-                    return Some(
-                        Response::builder()
-                            .status(StatusCode::from_u16(status).unwrap())
-                            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-                            .body(Body::from(entry.error_body(&msg).to_string()))
-                            .unwrap(),
-                    );
-                }
-                }
+            if let Some(refused) = api_gate(entry, &ctx, auth) {
+                return Some(refused);
             }
+            // a JSON body's fields are parameters too (farm 0.9.0)
+            let parsed: Option<Value> = serde_json::from_slice(body).ok();
             // table's write persists through the pagehandler — sweet itself
             // — so it is answered natively (table.rs), like shortlink's
             // expand; every other handler runs in the sidecar
             let outcome = if entry.short == "table" && entry.op_id == "write" {
-                api::arguments_for(&entry.op, query, &ctx)
+                api::arguments_for(&entry.op, query, parsed.as_ref(), &ctx)
                     .and_then(|args| table::farm_write(site, &args))
             } else {
-                entry.call(api, query, &ctx)
+                entry.call(api, query, parsed.as_ref(), None, &ctx)
             };
-            Some(match outcome {
-                Ok(value) => cors_json(value),
-                Err((status, msg)) => Response::builder()
-                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-                    .body(Body::from(entry.error_body(&msg).to_string()))
-                    .unwrap(),
-            })
+            Some(api_outcome(entry, outcome))
         }
     }
+}
+
+fn api_outcome(entry: &api::Mounted, outcome: Result<Value, (u16, String)>) -> Response {
+    match outcome {
+        Ok(value) => cors_json(value),
+        Err((status, msg)) => Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(Body::from(entry.error_body(&msg).to_string()))
+            .unwrap(),
+    }
+}
+
+/// The farm gate for a writing operation: key -> place -> person, a valid
+/// key short-circuiting the rest. Some(response) = refused.
+fn api_gate(entry: &api::Mounted, ctx: &api::SiteContext, auth: &Auth) -> Option<Response> {
+    if !entry.writes() {
+        return None;
+    }
+    let scope = format!("{}.{}", entry.short, entry.op_id);
+    if api::authorize_key(Path::new(&ctx.status), auth.api_key.as_deref(), &scope).is_some() {
+        return None;
+    }
+    let (status, msg) = api::write_refusal(&ctx.origin, auth.authorized)?;
+    Some(
+        Response::builder()
+            .status(StatusCode::from_u16(status).unwrap())
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(Body::from(entry.error_body(&msg).to_string()))
+            .unwrap(),
+    )
+}
+
+/// An operation whose body is a file (farm 0.9.0 mount.js): gate first,
+/// then stream the body into <status>/farm-tmp — never into anything the
+/// wiki serves — refusing it the moment it passes the limit, call the
+/// handler with {tmpPath, size, sha256, type}, and remove the file after
+/// (a handler that kept it has already moved it).
+async fn api_binary_route(
+    api: &api::Api,
+    entry: &api::Mounted,
+    site: &Site,
+    query: &str,
+    content_type: Option<&str>,
+    body: Body,
+    auth: &Auth,
+    port: u16,
+) -> Response {
+    let ctx = api::SiteContext::for_site(site, port);
+    if let Some(refused) = api_gate(entry, &ctx, auth) {
+        return refused;
+    }
+    let dir = Path::new(&ctx.status).join("farm-tmp");
+    let file = match receive_body(body, &dir, api::body_limit(&entry.op), content_type).await {
+        Ok(f) => f,
+        Err((status, msg)) => return api_outcome(entry, Err((status, msg))),
+    };
+    let tmp = file["tmpPath"].as_str().unwrap_or_default().to_string();
+    let outcome = entry.call(api, query, None, Some(&file), &ctx);
+    let _ = tokio::fs::remove_file(&tmp).await;
+    api_outcome(entry, outcome)
+}
+
+async fn receive_body(
+    body: Body,
+    dir: &Path,
+    limit: u64,
+    content_type: Option<&str>,
+) -> Result<Value, (u16, String)> {
+    use futures_util::StreamExt;
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+    let too_large = || (413, format!("the body is larger than this farm accepts ({limit} bytes)"));
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| (500, format!("cannot prepare the farm's temporary folder: {e}")))?;
+    let mut rnd = [0u8; 6];
+    getrandom::getrandom(&mut rnd).map_err(|e| (500, e.to_string()))?;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = dir.join(format!("{millis}-{hex}.part"));
+    let mut out = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await
+        .map_err(|e| (500, format!("cannot open a temporary file: {e}")))?;
+    let mut hash = sha2::Sha256::new();
+    let mut size: u64 = 0;
+    let mut stream = body.into_data_stream();
+    let failure = loop {
+        match stream.next().await {
+            None => break None,
+            Some(Err(_)) => break Some((400, "the upload was abandoned".to_string())),
+            Some(Ok(chunk)) => {
+                size += chunk.len() as u64;
+                if size > limit {
+                    break Some(too_large());
+                }
+                hash.update(&chunk);
+                if let Err(e) = out.write_all(&chunk).await {
+                    break Some((500, format!("cannot write the temporary file: {e}")));
+                }
+            }
+        }
+    };
+    let flushed = out.flush().await;
+    drop(out);
+    if let Some(err) = failure {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(err);
+    }
+    if let Err(e) = flushed {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err((500, format!("cannot write the temporary file: {e}")));
+    }
+    let sha: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok(json!({
+        "tmpPath": tmp.to_string_lossy(),
+        "size": size,
+        "sha256": sha,
+        "type": content_type.unwrap_or("application/octet-stream"),
+    }))
 }
 
 /// mcp handleMessage with the reference's throw-wrapper (INTERNAL_ERROR).

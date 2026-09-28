@@ -40,8 +40,23 @@ pub fn for_farm(farm_root: &Path, vendor: Option<&Path>) -> Option<Arc<Similarit
     }
     let built = vendor.and_then(|v| build(farm_root, v));
     if let Some(s) = &built {
-        let s = s.clone();
-        std::thread::spawn(move || s.warm_up());
+        let warm = s.clone();
+        std::thread::spawn(move || warm.warm_up());
+        // startServer's timers: the Site Index from peers now (forced) and
+        // hourly, the graveyard's verdicts now and every six hours — each
+        // a conditional GET that costs a 304 when nothing changed
+        let fresh = s.clone();
+        std::thread::spawn(move || {
+            let mut tick = 0u64;
+            loop {
+                fresh.refresh_site_index(tick == 0);
+                if tick % 6 == 0 {
+                    fresh.refresh_verdicts();
+                }
+                tick += 1;
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        });
     }
     g.insert(farm_root.to_path_buf(), built.clone());
     built
@@ -145,18 +160,7 @@ impl Host for NetHost {
     fn env(&self, k: &str) -> Option<String> { StdHost.env(k) }
 
     fn fetch(&self, url: &str, headers: &[(&str, &str)]) -> Option<Fetched> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirects(0)
-            .resolver(|addr: &str| -> std::io::Result<Vec<std::net::SocketAddr>> {
-                let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-                if host == "localhost" || host.ends_with(".localhost") {
-                    let port: u16 = addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(80);
-                    return Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))]);
-                }
-                std::net::ToSocketAddrs::to_socket_addrs(addr).map(|i| i.collect())
-            })
-            .build();
+        let agent = agent(std::time::Duration::from_secs(10));
         let mut req = agent.get(url);
         for (k, v) in headers {
             req = req.set(k, v);
@@ -172,6 +176,44 @@ impl Host for NetHost {
         std::io::Read::read_to_end(&mut resp.into_reader(), &mut body).ok()?;
         Some(Fetched { status, body, last_modified })
     }
+
+    fn post_json(&self, url: &str, body: &[u8], timeout_ms: u64) -> Result<Fetched, String> {
+        let resp = agent(std::time::Duration::from_millis(timeout_ms))
+            .post(url)
+            .set("Content-Type", "application/json")
+            .send_bytes(body);
+        let resp = match resp {
+            Ok(r) => r,
+            // a status is an answer: its body is what the peer said
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(ureq::Error::Transport(t)) => return Err(t.to_string()),
+        };
+        let status = resp.status();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut out).map_err(|e| e.to_string())?;
+        Ok(Fetched { status, body: out, last_modified: None })
+    }
+
+    fn touch(&self, p: &Path) -> bool {
+        StdHost.touch(p)
+    }
+}
+
+/// An agent that resolves *.localhost (and localhost) to loopback, as the
+/// plugin's lookup override does; no redirects followed.
+fn agent(timeout: std::time::Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .resolver(|addr: &str| -> std::io::Result<Vec<std::net::SocketAddr>> {
+            let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+            if host == "localhost" || host.ends_with(".localhost") {
+                let port: u16 = addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(80);
+                return Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))]);
+            }
+            std::net::ToSocketAddrs::to_socket_addrs(addr).map(|i| i.collect())
+        })
+        .build()
 }
 
 pub struct Incoming<'a> {

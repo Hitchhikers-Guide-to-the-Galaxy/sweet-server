@@ -488,7 +488,13 @@ async fn main() {
                         caller,
                         body: &body,
                     };
-                    if let Some(resp) = similarity::route(&site.data, site.vendor.as_deref(), &inc) {
+                    // block_in_place: the route blocks (the embedder bridge,
+                    // peer requests — sometimes to this very server), and a
+                    // blocked worker must hand its queued tasks to the others,
+                    // or a request to ourselves waits behind us until timeout
+                    if let Some(resp) = tokio::task::block_in_place(|| {
+                        similarity::route(&site.data, site.vendor.as_deref(), &inc)
+                    }) {
                         return resp;
                     }
                 }

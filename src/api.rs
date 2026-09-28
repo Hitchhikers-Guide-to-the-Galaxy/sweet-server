@@ -33,10 +33,12 @@ const METHODS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
 const NATIVE_PLUGIN_ROUTES: [&str; 5] =
     ["/plugin/assets/", "/plugin/plugmatic/", "/plugin/shortlink/", "/plugin/table/", "/plugin/oneclick/"];
 
-fn natively_served(declared_path: &str) -> bool {
+fn natively_served(plugin: &str, declared_path: &str) -> bool {
     NATIVE_PLUGIN_ROUTES
         .iter()
         .any(|prefix| declared_path.starts_with(prefix))
+        // the similarity server's /system routes, ported in similarity-core
+        || (plugin == "similarity" && similarity_core::PORTED.contains(&declared_path))
 }
 
 const INFO_DESCRIPTION: &str = "Every interface this farm offers, merged from what its plugins declare. A plugin declares a specification and a module of plain functions; the farm mounts them and describes them here. Only operations that are actually mounted appear — what was refused or skipped is listed under x-fedwiki-farm. A plugin whose wiki item text is a line-oriented command language publishes that language under x-fedwiki-vocabulary: each command says which parameter it produces, or that it never leaves the browser.";
@@ -274,7 +276,7 @@ impl Api {
                             "no operationId, so it cannot be named in the document");
                         continue;
                     }
-                    if !natively_served(spec_path) {
+                    if !natively_served(&d.name, spec_path) {
                         // the node farm describes these because the
                         // plugin's own server answers there; here it does
                         // not, and a description of a door that is not

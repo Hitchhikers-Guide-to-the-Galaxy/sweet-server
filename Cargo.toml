@@ -23,6 +23,10 @@ sha1 = "0.10"
 oneclick-core = { path = "../oneclick-orgs/core" }
 similarity-core = { path = "../similarity-core" }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# malloc_trim after the vector store's warm-up (similarity.rs)
+libc = "0.2"
+
 [profile.release]
 strip = true
 lto = true

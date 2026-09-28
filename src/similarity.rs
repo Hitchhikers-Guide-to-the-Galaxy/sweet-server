@@ -46,7 +46,17 @@ pub fn for_farm(farm_root: &Path, vendor: Option<&Path>) -> Option<Arc<Similarit
     let built = vendor.and_then(|v| build(farm_root, v));
     if let Some(s) = &built {
         let warm = s.clone();
-        std::thread::spawn(move || warm.warm_up());
+        std::thread::spawn(move || {
+            warm.warm_up();
+            // parsing every vectors file leaves the allocator holding the
+            // peak; hand what is free back to the system (glibc keeps it,
+            // measured on the Pi5)
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            // SAFETY: malloc_trim only releases free memory
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        });
         // startServer's timers: the Site Index from peers now (forced) and
         // hourly, the graveyard's verdicts now and every six hours — each
         // a conditional GET that costs a 304 when nothing changed

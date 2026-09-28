@@ -479,6 +479,7 @@ async fn main() {
                         // counts only on a site that has an owner file
                         session_trusted: auth.authorized
                             && site.data.join("status/owner.json").is_file(),
+                        authorized: auth.authorized,
                     };
                     let inc = similarity::Incoming {
                         method: method.as_str(),

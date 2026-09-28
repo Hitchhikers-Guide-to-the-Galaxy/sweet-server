@@ -7,6 +7,9 @@
 //   {"id":1,"op":"embed","path":"<embedder.js>","text":"…"} -> {"id":1,"ok":true,"value":[…]}
 //   {"id":2,"op":"status","path":"…"}                      -> the health route's embedder block
 //   {"id":3,"op":"warm","path":"…"}                        -> null (model warming in the background)
+//   {"id":4,"op":"index","path":"<semindex indexer.js>","argv":{…},"globs":"*","force":false}
+//        -> {queued, ...status()}, build-index's in-process branch; the
+//           first call init()s the indexer, which then scans as it does on node
 // A failure answers {"ok":false,"error":{"message","status"}}, status 503
 // when the embedder is down (err.code EMBEDDER_DOWN), else 502.
 //
@@ -32,7 +35,10 @@ rl.on('line', line => {
     try {
       const embedder = load(req.path)
       let value = null
-      if (req.op === 'embed') value = await embedder.embed(req.text)
+      if (req.op === 'index') {
+        embedder.init(req.argv)
+        value = { queued: embedder.enqueueGlobs(req.globs, req.force), ...embedder.status() }
+      } else if (req.op === 'embed') value = await embedder.embed(req.text)
       else if (req.op === 'status') value = embedder.status()
       else if (req.op === 'warm') embedder.warm()
       else throw new Error(`unknown op ${req.op}`)

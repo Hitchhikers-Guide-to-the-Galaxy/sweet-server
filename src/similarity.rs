@@ -82,6 +82,7 @@ fn build(farm_root: &Path, vendor: &Path) -> Option<Arc<Similarity>> {
         path: plugin_dir(vendor).join("server/embedder.js").to_string_lossy().into_owned(),
         farm_root: farm_root.to_path_buf(),
         sidecar: crate::sidecar::Sidecar::with_script(EMBED_JS, Some(std::time::Duration::from_secs(60))),
+        semindex: semindex_path(vendor),
     };
     // startServer warms the model unless an embed URL stands in for it
     if embedder.url().is_none() {
@@ -92,6 +93,19 @@ fn build(farm_root: &Path, vendor: &Path) -> Option<Arc<Similarity>> {
 
 const EMBED_JS: &str = include_str!("similarity_embed.js");
 
+/// wiki-plugin-semindex's indexer, resolved as server.js resolves it (the
+/// sibling package, then the vendor tree) — but only when this sweet's
+/// environment names WIKI_SEMINDEX_MODE. On node, installing semindex makes
+/// the farm a writer; sweet often shares its farm with a node farm whose
+/// semindex already writes, and a second writer is exactly what the mode
+/// exists to prevent, so here the operator says so explicitly.
+fn semindex_path(vendor: &Path) -> Option<String> {
+    std::env::var("WIKI_SEMINDEX_MODE").ok().filter(|m| !m.is_empty())?;
+    let sibling = plugin_dir(vendor).join("../wiki-plugin-semindex/server/indexer.js");
+    let vendored = vendor.join("wiki-plugin-semindex/server/indexer.js");
+    [sibling, vendored].into_iter().find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+}
+
 /// The plugin's own embedder, run in a Node bridge — or, when
 /// WIKI_EMBED_URL (else the farm root's similarity.json embedUrl) names
 /// one, a remote embedder over HTTP, as the plugin does.
@@ -99,6 +113,8 @@ struct BridgeEmbedder {
     path: String,
     farm_root: PathBuf,
     sidecar: crate::sidecar::Sidecar,
+    /// indexer.js, when semindex runs in the bridge (see semindex_path)
+    semindex: Option<String>,
 }
 
 impl BridgeEmbedder {
@@ -140,6 +156,25 @@ impl Embedder for BridgeEmbedder {
         self.sidecar
             .request("status", serde_json::json!({ "path": self.path }))
             .unwrap_or_else(|e| serde_json::json!({ "via": "child-process", "state": "down", "lastError": e }))
+    }
+
+    fn semindex_mode(&self) -> Option<String> {
+        self.semindex.as_ref()?;
+        // indexer.js MODE, from the same environment the bridge inherits
+        let m = std::env::var("WIKI_SEMINDEX_MODE").unwrap_or_default();
+        Some(if ["off", "query-only", "writer"].contains(&m.as_str()) { m } else { "writer".into() })
+    }
+
+    fn semindex_enqueue(&self, globs: &str, force: bool) -> Result<Value, String> {
+        let path = self.semindex.as_ref().ok_or("no indexer")?;
+        // argv as the farm hands it to plugins: farmRootOf(argv) is
+        // dirname(argv.data), so any child of the farm root names the farm
+        let data = self.farm_root.join("_");
+        self.sidecar
+            .request("index", serde_json::json!({
+                "path": path, "argv": { "farm": true, "data": data }, "globs": globs, "force": force,
+            }))
+            .map_err(|e| e.split_once(' ').map(|(_, m)| m.to_string()).unwrap_or(e))
     }
 }
 
@@ -196,6 +231,39 @@ impl Host for NetHost {
 
     fn touch(&self, p: &Path) -> bool {
         StdHost.touch(p)
+    }
+
+    fn get(&self, url: &str) -> Result<Fetched, String> {
+        // new URL(url) and http.get's own checks, in node's words
+        let (scheme, rest) = url.split_once("://").ok_or_else(|| "Invalid URL".to_string())?;
+        if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+            return Err(format!("Protocol \"{}:\" not supported. Expected \"http:\"", scheme.to_ascii_lowercase()));
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => (h.to_string(), p.to_string()),
+            _ => (authority.to_string(), if scheme.eq_ignore_ascii_case("https") { "443".into() } else { "80".into() }),
+        };
+        // getJson has no timeout; a long one stands in for "never"
+        let resp = match agent(std::time::Duration::from_secs(300)).get(url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(ureq::Error::Transport(t)) => {
+                return Err(match t.kind() {
+                    ureq::ErrorKind::Dns => format!("getaddrinfo ENOTFOUND {host}"),
+                    // node 20+ tries each address of a name (autoSelectFamily)
+                    // and reports an AggregateError, whose message is empty;
+                    // a bare address reports the one connect error
+                    ureq::ErrorKind::ConnectionFailed if host.parse::<std::net::IpAddr>().is_err() => String::new(),
+                    ureq::ErrorKind::ConnectionFailed => format!("connect ECONNREFUSED {host}:{port}"),
+                    _ => t.to_string(),
+                });
+            }
+        };
+        let status = resp.status();
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut body).map_err(|e| e.to_string())?;
+        Ok(Fetched { status, body, last_modified: None })
     }
 }
 

@@ -31,8 +31,13 @@ fn plugin_dir(vendor: &Path) -> PathBuf {
 }
 
 /// The Similarity for a farm root, built (and warmed, off the request path)
-/// on first use; None when the vendor has no similarity plugin.
+/// on first use; None when the vendor has no similarity plugin, or when
+/// SWEET_SIMILARITY=off (a farm that should not hold a second copy of the
+/// vectors and the model, such as the Pi5's shadow doors).
 pub fn for_farm(farm_root: &Path, vendor: Option<&Path>) -> Option<Arc<Similarity>> {
+    if std::env::var("SWEET_SIMILARITY").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        return None;
+    }
     let farms = FARMS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut g = farms.lock().unwrap();
     if let Some(s) = g.get(farm_root) {

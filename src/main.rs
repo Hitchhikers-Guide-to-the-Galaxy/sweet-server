@@ -441,30 +441,6 @@ async fn main() {
                     if_none_match,
                     range,
                 };
-                // the similarity routes, native (similarity.rs + the
-                // similarity-core crate); unported ones fall through
-                if path.starts_with("/system/") {
-                    let caller = similarity_core::Caller {
-                        remote_ip: remote_ip.clone(),
-                        forwarded_for: xff.clone(),
-                        origin: auth.origin.clone(),
-                        host: req_host.clone(),
-                        // trust.js trustedSession: an authorised session
-                        // counts only on a site that has an owner file
-                        session_trusted: auth.authorized
-                            && site.data.join("status/owner.json").is_file(),
-                    };
-                    let inc = similarity::Incoming {
-                        method: method.as_str(),
-                        path: &path,
-                        query: &query,
-                        if_modified_since: if_modified_since.as_deref(),
-                        caller,
-                    };
-                    if let Some(resp) = similarity::route(&site.data, site.vendor.as_deref(), &inc) {
-                        return resp;
-                    }
-                }
                 // an api operation whose body is a file is streamed to disk
                 // rather than buffered (farm 0.9.0) — decided before the
                 // body is read, since reading it is what the stream replaces
@@ -491,6 +467,31 @@ async fn main() {
                 let body = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
                     .await
                     .unwrap_or_default();
+                // the similarity routes, native (similarity.rs + the
+                // similarity-core crate); unported ones fall through
+                if path.starts_with("/system/") {
+                    let caller = similarity_core::Caller {
+                        remote_ip: remote_ip.clone(),
+                        forwarded_for: xff.clone(),
+                        origin: auth.origin.clone(),
+                        host: req_host.clone(),
+                        // trust.js trustedSession: an authorised session
+                        // counts only on a site that has an owner file
+                        session_trusted: auth.authorized
+                            && site.data.join("status/owner.json").is_file(),
+                    };
+                    let inc = similarity::Incoming {
+                        method: method.as_str(),
+                        path: &path,
+                        query: &query,
+                        if_modified_since: if_modified_since.as_deref(),
+                        caller,
+                        body: &body,
+                    };
+                    if let Some(resp) = similarity::route(&site.data, site.vendor.as_deref(), &inc) {
+                        return resp;
+                    }
+                }
                 // sweet-client mode answers shell/app/api paths first; the
                 // wiki API below keeps serving either way
                 if let Some(resp) =

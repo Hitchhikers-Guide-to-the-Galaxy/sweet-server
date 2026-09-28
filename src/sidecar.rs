@@ -34,6 +34,10 @@ fn call_timeout() -> Duration {
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
 
 pub struct Sidecar {
+    /// the host script node runs: the handler host, or another bridge
+    script: &'static str,
+    /// overrides the call timeout for this sidecar
+    timeout: Option<Duration>,
     inner: Mutex<Inner>,
 }
 
@@ -51,7 +55,16 @@ struct Running {
 
 impl Sidecar {
     pub fn new() -> Sidecar {
+        Sidecar::with_script(HOST_JS, None)
+    }
+
+    /// A sidecar running a different NDJSON host script — similarity's
+    /// embedder bridge runs in its own process, so a query's embed never
+    /// waits behind a slow handler call.
+    pub fn with_script(script: &'static str, timeout: Option<Duration>) -> Sidecar {
         Sidecar {
+            script,
+            timeout,
             inner: Mutex::new(Inner {
                 child: None,
                 next_id: 0,
@@ -60,9 +73,9 @@ impl Sidecar {
         }
     }
 
-    fn spawn() -> Result<Running, String> {
+    fn spawn(script: &str) -> Result<Running, String> {
         let mut child = Command::new("node")
-            .args(["--input-type=commonjs", "-e", HOST_JS])
+            .args(["--input-type=commonjs", "-e", script])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -87,7 +100,7 @@ impl Sidecar {
                     return Err("node runtime unavailable — retry shortly".into());
                 }
             }
-            match Self::spawn() {
+            match Self::spawn(self.script) {
                 Ok(r) => {
                     inner.child = Some(r);
                     inner.last_failure = None;
@@ -111,7 +124,7 @@ impl Sidecar {
         }
         // sequential host: the next line is our answer. Reads happen on a
         // helper thread so a hung handler cannot hang the server.
-        let deadline = Instant::now() + call_timeout();
+        let deadline = Instant::now() + self.timeout.unwrap_or_else(call_timeout);
         let mut buf = String::new();
         loop {
             buf.clear();
@@ -142,7 +155,7 @@ impl Sidecar {
                     return Err(format!(
                         "call timed out after {}s — the handler was killed \
                          (sweet divergence: the reference waits forever)",
-                        call_timeout().as_secs()
+                        self.timeout.unwrap_or_else(call_timeout).as_secs()
                     ));
                 }
                 ReadOutcome::Eof => {

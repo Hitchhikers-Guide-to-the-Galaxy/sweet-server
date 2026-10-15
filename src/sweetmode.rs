@@ -157,6 +157,11 @@ pub fn route(
                 json!({
                     "owned": owner.is_some(),
                     "ownerName": owner,
+                    // which login door this site has: the padlock draws a
+                    // claim/reclaim flow for friends, a Keycloak sign-in
+                    // for oauth2, and nothing at all for default
+                    "mode": if site.oidc.is_some() { "oauth2" }
+                            else { site.security.mode_name() },
                     "authenticated": auth.user,
                     "isOwner": is_owner,
                     // back-compat with the first cut of this route

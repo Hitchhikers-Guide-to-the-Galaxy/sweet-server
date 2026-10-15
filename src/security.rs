@@ -222,6 +222,19 @@ impl Security {
         matches!(self.mode, Mode::Friends) && self.session_friend(cookie_header).is_some()
     }
 
+    /// The mode as the Sweet Client's padlock spells it — the client
+    /// cannot draw a login door without knowing which door it is
+    /// (`/api/me`). oauth2 is reported by sweetmode from `site.oidc`,
+    /// since Mode::OAuth2 authorises through oauth2_is_authorized.
+    pub fn mode_name(&self) -> &'static str {
+        match self.mode {
+            Mode::Default => "default",
+            Mode::Legacy => "legacy",
+            Mode::Friends => "friends",
+            Mode::OAuth2 => "oauth2",
+        }
+    }
+
     /// isAuthorized — gates every write and the recycler reads.
     pub fn is_authorized(&self, cookie_header: Option<&str>) -> bool {
         self.refresh_owner();

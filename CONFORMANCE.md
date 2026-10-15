@@ -9,28 +9,28 @@ tier-agnostic. Counts are candidate-side passes.
 
 | Level | Tier          | Tests      | Status | Date       |
 |-------|---------------|------------|--------|------------|
-| L0    | t0-minimal    | 11         | PASS   | 2026-09-03 |
-| L0    | t1-core-items | 11         | PASS   | 2026-09-03 |
-| L0    | t2-journal    | 11         | PASS   | 2026-09-03 |
-| L1    | t0-minimal    | 21         | PASS   | 2026-09-03 |
-| L1    | t1-core-items | 21         | PASS   | 2026-09-03 |
-| L1    | t2-journal    | 21         | PASS   | 2026-09-03 |
-| L2    | t0-minimal    | 20 (+1 s)  | PASS   | 2026-09-03 |
-| L2    | t1-core-items | 20 (+1 s)  | PASS   | 2026-09-03 |
-| L2    | t2-journal    | 20 (+1 s)  | PASS   | 2026-09-03 |
-| L3    | t0-minimal    | 14         | PASS   | 2026-09-03 |
-| L3    | t1-core-items | 14         | PASS   | 2026-09-03 |
-| L3    | t2-journal    | 14         | PASS   | 2026-09-03 |
-| L4    | t0-minimal    | 11         | PASS   | 2026-09-03 |
-| L4    | t1-core-items | 11         | PASS   | 2026-09-03 |
-| L4    | t2-journal    | 11         | PASS   | 2026-09-03 |
-| L5    | self-booted   | 13 (+1 x)  | PASS   | 2026-09-03 |
-| L6    | self-booted   | 19 (+1 x)  | PASS   | 2026-09-03 |
-| L7    | self-booted   | 105 (+2 s) | PASS   | 2026-09-03 |
-| EXT   | self-booted   | 7          | PASS   | 2026-09-03 |
+| L0    | t0-minimal    | 11         | PASS   | 2026-10-15 |
+| L0    | t1-core-items | 11         | PASS   | 2026-10-15 |
+| L0    | t2-journal    | 11         | PASS   | 2026-10-15 |
+| L1    | t0-minimal    | 24         | PASS   | 2026-10-15 |
+| L1    | t1-core-items | 24         | PASS   | 2026-10-15 |
+| L1    | t2-journal    | 24         | PASS   | 2026-10-15 |
+| L2    | t0-minimal    | 20 (+1 s)  | PASS   | 2026-10-15 |
+| L2    | t1-core-items | 20 (+1 s)  | PASS   | 2026-10-15 |
+| L2    | t2-journal    | 20 (+1 s)  | PASS   | 2026-10-15 |
+| L3    | t0-minimal    | 14         | PASS   | 2026-10-15 |
+| L3    | t1-core-items | 14         | PASS   | 2026-10-15 |
+| L3    | t2-journal    | 14         | PASS   | 2026-10-15 |
+| L4    | t0-minimal    | 11         | PASS   | 2026-10-15 |
+| L4    | t1-core-items | 11         | PASS   | 2026-10-15 |
+| L4    | t2-journal    | 11         | PASS   | 2026-10-15 |
+| L5    | self-booted   | 13 (+1 x)  | PASS   | 2026-10-15 |
+| L6    | self-booted   | 19 (+1 x)  | PASS   | 2026-10-15 |
+| L7    | self-booted   | 108 (+2 s) | PASS   | 2026-10-15 |
+| EXT   | self-booted   | 7          | PASS   | 2026-10-15 |
 
 `s` = skipped, `x` = xfail on the REFERENCE (a registered spec BUG the
-suite refuses to copy — see BUGS.toml). 226 tests collected in total.
+suite refuses to copy — see BUGS.toml). 364 tests collected in total.
 Reproduce the whole table in one command:
 
     targets/fedwiki-server/scripts/ratchet-sweep.py
@@ -99,6 +99,29 @@ sweet's stateless signed session stays small.
 endpoint, the try door, the key→place→person gate, and the honesty rules
 for unserved plugin operations. Two shortlink probes skip when something
 already listens on 127.0.0.1:80 (the port-80 wall, dossier §4.4.14).
+
+**L7 CAUGHT UP (2026-10-15)**: the vendored oracle symlinks into the live
+plugin checkouts, and they had moved past sweet's ports; the drift
+surfaced once the dead wiki-plugin-family link was removed and the
+reference booted again. Sweet conformed rather than pinning the vendor
+back:
+- table 0.8.2 parser — `LAYOUT table|list|auto`, with `grid`/`stack` read
+  as warned aliases (`LAYOUT grid — say LAYOUT table`), `CAPTION off`,
+  and `REORDER`/`INDEX` peeled as directives instead of leaking into the
+  data (src/table.rs).
+- farm 0.9.2 — the farm's own declaration (tag `farm`: `assetsList`,
+  `assetsUpload`, handlers in the sidecar); `isPrivateSite` reads past a
+  scheme, so the document's `here` now judges the real host (the old
+  "always public" quirk is gone upstream and here); FARM_API_PRIVATE_SUFFIXES;
+  FARM_API_PUBLIC_WRITES as a switch or a scope list, with the refusal
+  naming the scope; `x-fedwiki-gate: place` (a private site skips the
+  person, the try door still asks `rights` exactly as try.js does);
+  `asks` in `x-fedwiki-gated`; and `x-fedwiki-cross-origin` preflight and
+  echoed-origin headers (src/api.rs, src/main.rs).
+The suite's own pins moved with it: `FIVE` stays the five sibling
+declarers and the tag check adds the farm's own; the grid fixture now
+expects `table` plus the warning; new pins `captionless-list` and three
+`farm_assetsList` calls.
 
 ## Running the candidate
 

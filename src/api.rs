@@ -1,6 +1,7 @@
 //! The fedwiki.api v1 door — a native port of the reference Farm Plugin's
-//! serving side (wiki-plugin-farm 0.8.0-apikey.0: discover.js, mount.js,
-//! merge.js, gate.js, mcp.js, vocabulary.js), pinned differentially by the
+//! serving side (wiki-plugin-farm 0.9.2: discover.js, mount.js, merge.js,
+//! gate.js, mcp.js, vocabulary.js, and the farm's own assets.js
+//! declaration — its handlers run in the sidecar), pinned differentially by the
 //! conformance harness. Handlers themselves run in the ONE embedded Node
 //! sidecar (sidecar.rs); everything else — discovery, coercion, defaults,
 //! context, gating, the merged document, MCP — is Rust.
@@ -221,6 +222,16 @@ impl Api {
             .cloned()
             .collect();
         siblings.sort();
+        // server.js (farm 0.9.0): the farm's own operations (assets),
+        // declared the way a sibling's are and mounted by the same code —
+        // gated, documented and offered to agents with no special case
+        match read_declaration(vendor, "wiki-plugin-farm") {
+            Ok(None) => {}
+            Ok(Some(d)) => api.mount(d),
+            Err(why) => api
+                .refused
+                .push(("wiki-plugin-farm".into(), format!("its own operations — {why}"))),
+        }
         for pkg_name in siblings {
             match read_declaration(vendor, &pkg_name) {
                 Ok(None) => {}
@@ -779,42 +790,139 @@ pub fn authorize_key(
 
 // gate.js — place and person; a valid key short-circuits both.
 
-fn is_private_site(origin: &str) -> bool {
-    let host = origin.split(':').next().unwrap_or("").to_lowercase();
-    host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local")
+/// gate.js isPrivateSite (farm 0.9.1): a bare host, a host:port, or a full
+/// origin with its scheme — the document route hands over the last of
+/// these. localhost, *.localhost and *.local, plus the operator's
+/// FARM_API_PRIVATE_SUFFIXES.
+pub fn is_private_site(origin: &str) -> bool {
+    static SCHEME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let scheme = SCHEME.get_or_init(|| regex::Regex::new(r"(?i)^[a-z][a-z0-9+.-]*://").unwrap());
+    let rest = scheme.replace(origin, "");
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return true;
+    }
+    private_suffixes()
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
-fn public_writes_allowed() -> bool {
-    let v = std::env::var("FARM_API_PUBLIC_WRITES").unwrap_or_default();
-    regex::Regex::new(r"^(1|yes|true|on)$")
-        .unwrap()
-        .is_match(&v.to_lowercase())
+/// gate.js privateSuffixes (farm 0.9.0): FARM_API_PRIVATE_SUFFIXES is a
+/// comma list (`.private.fish,lan`); a leading dot is optional.
+fn private_suffixes() -> Vec<String> {
+    std::env::var("FARM_API_PRIVATE_SUFFIXES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase().trim_start_matches('.').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
-fn describe_gate(origin: &str) -> Value {
-    json!({
-        "rights": "may edit this site, by the wiki's own test",
-        "apiKey": "an X-Api-Key listed in the site's status/api-keys.json is accepted where one is configured",
-        "publicSites": if public_writes_allowed() {
-            "allowed — FARM_API_PUBLIC_WRITES is set"
-        } else {
-            "refused unless FARM_API_PUBLIC_WRITES is set"
-        },
-        "here": if is_private_site(origin) { "private" } else { "public" },
-        "offeredToAgents": false
-    })
+fn public_writes_setting() -> String {
+    std::env::var("FARM_API_PUBLIC_WRITES").unwrap_or_default().trim().to_string()
 }
 
-/// The refusal, in the reference's order: place, then person. (A valid
-/// api-key would short-circuit both — Phase 2.) Returns Some((status, msg)).
-pub fn write_refusal(origin: &str, authorized: bool) -> Option<(u16, String)> {
-    if !is_private_site(origin) && !public_writes_allowed() {
+/// gate.js publicWritesAllowed (farm 0.9.1): either a switch that opens
+/// every write, or a comma list of `<plugin>.<operationId>` scopes that
+/// opens only those.
+pub fn public_writes_allowed(scope: Option<&str>) -> bool {
+    let setting = public_writes_setting();
+    if regex::Regex::new(r"(?i)^(1|yes|true|on)$").unwrap().is_match(&setting) {
+        return true;
+    }
+    let Some(scope) = scope.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if setting.is_empty() {
+        return false;
+    }
+    setting.split(',').map(str::trim).any(|s| s == scope)
+}
+
+fn public_write_scopes() -> Vec<String> {
+    let setting = public_writes_setting();
+    if setting.is_empty()
+        || regex::Regex::new(r"(?i)^(1|yes|true|on|0|no|false|off)$")
+            .unwrap()
+            .is_match(&setting)
+    {
+        return Vec::new();
+    }
+    setting
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// gate.js describeGate — merge.js calls it with no status, so apiKey is
+/// the general sentence; `gate` is the operation's x-fedwiki-gate.
+fn describe_gate(origin: &str, gate: &str) -> Value {
+    let place = gate == "place";
+    let scopes = public_write_scopes();
+    let mut d = Map::new();
+    d.insert("asks".into(), json!(if place {
+        "the place only on a private site — any caller; on a public site that FARM_API_PUBLIC_WRITES allows, the caller too"
+    } else {
+        "the place, then the caller"
+    }));
+    d.insert("rights".into(), json!(if place {
+        "not asked on a private site — this operation changes no page; on a public site, may edit this site, by the wiki's own test"
+    } else {
+        "may edit this site, by the wiki's own test"
+    }));
+    d.insert("apiKey".into(), json!(
+        "an X-Api-Key listed in the site's status/api-keys.json is accepted where one is configured"));
+    d.insert("publicSites".into(), json!(if public_writes_allowed(None) {
+        "allowed — FARM_API_PUBLIC_WRITES is set".to_string()
+    } else if !scopes.is_empty() {
+        format!("allowed only for {} — FARM_API_PUBLIC_WRITES lists them", scopes.join(", "))
+    } else {
+        "refused unless FARM_API_PUBLIC_WRITES is set".to_string()
+    }));
+    if !origin.is_empty() {
+        d.insert("here".into(), json!(if is_private_site(origin) { "private" } else { "public" }));
+    }
+    d.insert("offeredToAgents".into(), json!(false));
+    Value::Object(d)
+}
+
+/// mount.js — how much the gate asks of a write: 'place' or 'rights'.
+pub fn gate_of(op: &Value) -> &'static str {
+    if op["x-fedwiki-gate"] == "place" { "place" } else { "rights" }
+}
+
+/// gate.js refuseWrite, after the key check: place, then person — except
+/// that a place-gated operation on a private site skips the person.
+/// Returns Some((status, msg)).
+pub fn write_refusal(
+    origin: &str,
+    authorized: bool,
+    scope: &str,
+    gate: &str,
+) -> Option<(u16, String)> {
+    if !is_private_site(origin) && !public_writes_allowed(Some(scope)) {
+        let listed = if scope.is_empty() { "the operation" } else { scope };
         return Some((403, format!(
             "{origin} is not a private site, and this farm has not been asked to allow \
-             writes to public ones. Set FARM_API_PUBLIC_WRITES to turn that on, knowing \
-             that it opens page changes to anyone this farm considers authorised — or \
-             give the caller an API key in this site's status/api-keys.json."
+             writes to public ones. Set FARM_API_PUBLIC_WRITES to turn that on (or list \
+             {listed} in it), knowing that it opens page changes to anyone this farm \
+             considers authorised — or give the caller an API key in this site's \
+             status/api-keys.json."
         )));
+    }
+    if gate == "place" && is_private_site(origin) {
+        return None;
     }
     if !authorized {
         return Some((403, format!(
@@ -823,6 +931,13 @@ pub fn write_refusal(origin: &str, authorized: bool) -> Option<(u16, String)> {
         )));
     }
     None
+}
+
+/// gate.js crossOriginAllowed (farm 0.9.1): an operation that declares
+/// x-fedwiki-cross-origin is answered to a page from another origin only
+/// where the site is private, or public writes are allowed for it.
+pub fn cross_origin_allowed(origin: &str, scope: &str) -> bool {
+    is_private_site(origin) || public_writes_allowed(Some(scope))
 }
 
 impl Api {
@@ -925,7 +1040,7 @@ impl Api {
             "id": farm_identity(&sites, &ctx.farm_root),
             "writes": {
                 "mounted": writes_mounted,
-                "publicSites": if public_writes_allowed() {
+                "publicSites": if public_writes_allowed(None) {
                     "allowed"
                 } else {
                     "refused unless FARM_API_PUBLIC_WRITES is set"
@@ -972,10 +1087,9 @@ impl Api {
             merged["x-fedwiki-base"] = json!(d.base);
         }
         if merged["x-fedwiki-writes"] == true {
-            // reference quirk kept: describeGate receives the full origin
-            // URL, whose split(':')[0] is the scheme — so the DOCUMENT
-            // always says "public" while the live gate judges the site
-            merged["x-fedwiki-gated"] = describe_gate(origin_url);
+            // describeGate receives the full origin URL, which isPrivateSite
+            // reads past its scheme since farm 0.9.1
+            merged["x-fedwiki-gated"] = describe_gate(origin_url, gate_of(op));
         }
         if let Some(voc) = voc {
             if let Some(params) = merged["parameters"].as_array_mut() {
@@ -1640,7 +1754,8 @@ pub fn try_operation(
         let scope = format!("{}.{}", entry.short, entry.op_id);
         let keyed = authorize_key(Path::new(&ctx.status), api_key, &scope).is_some();
         if !keyed {
-            if let Some((_, why)) = write_refusal(&ctx.origin, authorized) {
+            // try.js asks refuseWrite with no gate — always 'rights'
+            if let Some((_, why)) = write_refusal(&ctx.origin, authorized, &scope, "rights") {
                 return render_problem(
                     "Not allowed to change that",
                     &why,

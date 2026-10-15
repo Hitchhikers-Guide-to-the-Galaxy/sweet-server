@@ -914,10 +914,24 @@ fn api_route(
                     .unwrap(),
             })
         }
+        ("OPTIONS", _) => {
+            // mount.js (farm 0.9.1): the preflight a browser sends before a
+            // cross-origin call, for an operation declaring
+            // x-fedwiki-cross-origin — headers only where the place allows
+            let entry = api
+                .registry
+                .iter()
+                .find(|m| m.route == path && m.op["x-fedwiki-cross-origin"] == true)?;
+            let resp = Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap();
+            Some(allow_origin(resp, entry, &ctx, auth))
+        }
         _ => {
             let entry = api.find(method, path)?;
             if let Some(refused) = api_gate(entry, &ctx, auth) {
-                return Some(refused);
+                return Some(allow_origin(refused, entry, &ctx, auth));
             }
             // a JSON body's fields are parameters too (farm 0.9.0)
             let parsed: Option<Value> = serde_json::from_slice(body).ok();
@@ -930,9 +944,42 @@ fn api_route(
             } else {
                 entry.call(api, query, parsed.as_ref(), None, &ctx)
             };
-            Some(api_outcome(entry, outcome))
+            Some(allow_origin(api_outcome(entry, outcome), entry, &ctx, auth))
         }
     }
+}
+
+/// gate.js allowOrigin (farm 0.9.1), for an operation that declares
+/// x-fedwiki-cross-origin where crossOriginAllowed: echo the asking
+/// origin, never allow credentials. Elsewhere the response is untouched.
+fn allow_origin(
+    mut resp: Response,
+    entry: &api::Mounted,
+    ctx: &api::SiteContext,
+    auth: &Auth,
+) -> Response {
+    if entry.op["x-fedwiki-cross-origin"] != true {
+        return resp;
+    }
+    let scope = format!("{}.{}", entry.short, entry.op_id);
+    if !api::cross_origin_allowed(&ctx.origin, &scope) {
+        return resp;
+    }
+    let Some(asking) = auth.origin.as_deref().and_then(|o| HeaderValue::from_str(o).ok()) else {
+        return resp;
+    };
+    let h = resp.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, asking);
+    h.insert(header::VARY, HeaderValue::from_static("Origin"));
+    if let Ok(v) = HeaderValue::from_str(&format!("{}, OPTIONS", entry.method.to_uppercase())) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
+    }
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Accept, Content-Type, X-Recording-Type, X-Api-Key"),
+    );
+    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
+    resp
 }
 
 fn api_outcome(entry: &api::Mounted, outcome: Result<Value, (u16, String)>) -> Response {
@@ -956,7 +1003,8 @@ fn api_gate(entry: &api::Mounted, ctx: &api::SiteContext, auth: &Auth) -> Option
     if api::authorize_key(Path::new(&ctx.status), auth.api_key.as_deref(), &scope).is_some() {
         return None;
     }
-    let (status, msg) = api::write_refusal(&ctx.origin, auth.authorized)?;
+    let (status, msg) =
+        api::write_refusal(&ctx.origin, auth.authorized, &scope, api::gate_of(&entry.op))?;
     Some(
         Response::builder()
             .status(StatusCode::from_u16(status).unwrap())
@@ -983,17 +1031,19 @@ async fn api_binary_route(
 ) -> Response {
     let ctx = api::SiteContext::for_site(site, port);
     if let Some(refused) = api_gate(entry, &ctx, auth) {
-        return refused;
+        return allow_origin(refused, entry, &ctx, auth);
     }
     let dir = Path::new(&ctx.status).join("farm-tmp");
     let file = match receive_body(body, &dir, api::body_limit(&entry.op), content_type).await {
         Ok(f) => f,
-        Err((status, msg)) => return api_outcome(entry, Err((status, msg))),
+        Err((status, msg)) => {
+            return allow_origin(api_outcome(entry, Err((status, msg))), entry, &ctx, auth)
+        }
     };
     let tmp = file["tmpPath"].as_str().unwrap_or_default().to_string();
     let outcome = entry.call(api, query, None, Some(&file), &ctx);
     let _ = tokio::fs::remove_file(&tmp).await;
-    api_outcome(entry, outcome)
+    allow_origin(api_outcome(entry, outcome), entry, &ctx, auth)
 }
 
 async fn receive_body(

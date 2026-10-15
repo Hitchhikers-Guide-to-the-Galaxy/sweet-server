@@ -8,7 +8,9 @@
 //! (the key's id, 'farm-api', 'api'), exactly the reference's shape.
 //!
 //! Ported from wiki-plugin-table 0.5.0: server/server.js, server/core.js,
-//! src/parse/parse.cjs. Behaviour pinned by
+//! src/parse/parse.cjs — the parser brought up to 0.8.2 (LAYOUT table|list
+//! with grid/stack as warned aliases, CAPTION off, REORDER and INDEX
+//! peeled as directives). Behaviour pinned by
 //! conformance tests/L7_api/plugins/test_table_probe.py.
 
 use axum::{body::Body, http::header, http::StatusCode, response::Response};
@@ -101,10 +103,13 @@ struct Directives {
     set: usize, // how many directives were recorded (Object.keys().length)
 }
 
-const LAYOUTS: [&str; 3] = ["grid", "stack", "auto"];
+const LAYOUTS: [&str; 3] = ["table", "list", "auto"];
+/// the old words, still read, with a warning (table 0.7.0)
+const LAYOUT_ALIASES: [(&str, &str); 2] = [("grid", "table"), ("stack", "list")];
 const FOLDS: [&str; 3] = ["closed", "open", "none"];
 const FITS: [&str; 2] = ["first", "even"];
-const DIRECTIVE_WORDS: [&str; 6] = ["CAPTION", "LAYOUT", "SORT", "KEY", "FOLD", "FIT"];
+const DIRECTIVE_WORDS: [&str; 8] =
+    ["CAPTION", "LAYOUT", "SORT", "KEY", "FOLD", "FIT", "REORDER", "INDEX"];
 
 fn split_lines(text: &str) -> Vec<String> {
     text.replace("\r\n", "\n")
@@ -139,19 +144,29 @@ fn take_directives(lines: &[String]) -> (Directives, Vec<String>, Vec<String>) {
         let vt = value.trim();
         match key {
             "CAPTION" => {
-                d.caption = Some(vt.to_string());
+                // CAPTION off hides the footer: caption '' (read as null)
+                d.caption = Some(if vt.eq_ignore_ascii_case("off") {
+                    String::new()
+                } else {
+                    vt.to_string()
+                });
                 d.set += 1;
             }
             "LAYOUT" => {
-                let v = vt.to_lowercase();
+                let mut v = vt.to_lowercase();
+                if let Some((old, new)) = LAYOUT_ALIASES.iter().find(|(old, _)| *old == v) {
+                    warnings.push(format!("LAYOUT {old} — say LAYOUT {new}"));
+                    v = new.to_string();
+                }
                 if LAYOUTS.contains(&v.as_str()) {
                     d.layout = Some(v);
                     d.set += 1;
                 } else {
-                    warnings.push(format!("LAYOUT {vt} — expected grid, stack or auto"));
+                    warnings.push(format!("LAYOUT {vt} — expected table, list or auto"));
                 }
             }
-            "SORT" | "KEY" => d.set += 1, // recorded; unused by the server surface
+            // recorded; unused by the server surface
+            "SORT" | "KEY" | "REORDER" | "INDEX" => d.set += 1,
             "FOLD" => {
                 let v = vt.to_lowercase();
                 if FOLDS.contains(&v.as_str()) {

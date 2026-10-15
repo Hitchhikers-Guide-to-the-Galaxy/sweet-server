@@ -1382,9 +1382,17 @@ fn parse_lineup(path: &str) -> Option<Vec<(String, String)>> {
         let loc_ok = loc
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || ":.-".contains(c));
-        let slug_ok = slug
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        // [a-z0-9-]+(_rev\d+)? — a revision slug opens the same shell and the
+        // client builds the old story from the journal.
+        let (base, rev) = match slug.split_once("_rev") {
+            Some((base, rev)) => (base, Some(rev)),
+            None => (slug, None),
+        };
+        let slug_ok = !base.is_empty()
+            && base
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && rev.is_none_or(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()));
         if !loc_ok || !slug_ok || loc == "plugin" || loc == "auth" {
             return None;
         }

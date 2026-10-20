@@ -993,18 +993,21 @@ fn api_outcome(entry: &api::Mounted, outcome: Result<Value, (u16, String)>) -> R
     }
 }
 
-/// The farm gate for a writing operation: key -> place -> person, a valid
-/// key short-circuiting the rest. Some(response) = refused.
+/// The farm gate for a writing operation (farm 0.10.0): private-only ->
+/// key -> public mark -> spend policy -> person, a valid key short-circuiting
+/// everything after the private-only check. Some(response) = refused.
 fn api_gate(entry: &api::Mounted, ctx: &api::SiteContext, auth: &Auth) -> Option<Response> {
     if !entry.writes() {
         return None;
     }
     let scope = format!("{}.{}", entry.short, entry.op_id);
-    if api::authorize_key(Path::new(&ctx.status), auth.api_key.as_deref(), &scope).is_some() {
-        return None;
-    }
-    let (status, msg) =
-        api::write_refusal(&ctx.origin, auth.authorized, &scope, api::gate_of(&entry.op))?;
+    let refusal = api::private_only_refusal(&ctx.origin, &scope, &entry.op).or_else(|| {
+        if api::authorize_key(Path::new(&ctx.status), auth.api_key.as_deref(), &scope).is_some() {
+            return None;
+        }
+        api::write_refusal(&ctx.origin, auth.authorized, &scope, &entry.op)
+    });
+    let (status, msg) = refusal?;
     Some(
         Response::builder()
             .status(StatusCode::from_u16(status).unwrap())

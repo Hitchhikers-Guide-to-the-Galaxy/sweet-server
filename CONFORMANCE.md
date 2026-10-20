@@ -123,6 +123,18 @@ declarers and the tag check adds the farm's own; the grid fixture now
 expects `table` plus the warning; new pins `captionless-list` and three
 `farm_assetsList` calls.
 
+Farm 0.10.0 (2026-10-20) — the owner writes by default. Sweet conformed:
+a public site no longer refuses writes unless listed; `FARM_API_PUBLIC_REFUSE`
+(scopes or `all`, and the old `FARM_API_PUBLIC_WRITES=off`) marks refusals,
+whose list now only widens cross-origin answers; `x-fedwiki-spends` follows
+`FARM_API_SPEND` (private default / authors / none); `x-fedwiki-private-only`
+is refused on public sites BEFORE the key check; the try door now passes the
+entry's gate as try.js does; `x-fedwiki-gated` gains `spends`/`privateOnly`
+and the document `writes` gains `spending` (src/api.rs, src/main.rs). L7 pins:
+the doors boot with `FARM_API_PUBLIC_REFUSE=table.write,freeculture.place`, so
+the place/key/try refusals are the public-mark prose. Not differentially
+covered: spends and private-only (no vendor plugin declares them yet).
+
 ## Running the candidate
 
 Build first: `cargo build --release` (the sweep below used

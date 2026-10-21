@@ -1625,9 +1625,31 @@ fn plugin_static(site: &Site, path: &str) -> Response {
     if file.contains("..") {
         return not_found("Not found");
     }
-    match site.vendor.as_ref().and_then(|v| {
-        read(&v.join(format!("wiki-plugin-{name}/client")).join(file))
-    }) {
+    let Some(client) = site
+        .vendor
+        .as_ref()
+        .map(|v| v.join(format!("wiki-plugin-{name}/client")))
+    else {
+        return not_found("Not found");
+    };
+    // express.static: a folder answers with its index.html, and a folder
+    // URL without the trailing slash is 301'd to add it. The graphviz zoom
+    // popup opens /plugins/graphviz/dialog/ and depends on this.
+    let target = client.join(file);
+    if target.is_dir() {
+        if !file.is_empty() && !file.ends_with('/') {
+            return Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header(header::LOCATION, format!("{path}/"))
+                .body(Body::empty())
+                .unwrap();
+        }
+        return match read(&target.join("index.html")) {
+            Some(bytes) => serve_bytes(bytes, "text/html; charset=utf-8"),
+            None => not_found("Not found"),
+        };
+    }
+    match read(&target) {
         Some(bytes) => serve_bytes(bytes, guess_mime(path)),
         None => not_found("Not found"),
     }

@@ -1031,8 +1031,7 @@ pub fn rights_refusal(origin: &str, asker: Option<&Asker>) -> String {
             let whose = a.owner.as_deref().map(|o| format!("{o}'s")).unwrap_or_else(|| "the site owner's".into());
             format!(
                 "You are not signed in on {origin}. Sign in there first — use the sign-in lock at the foot of the page — \
-                 then try again. This needs {whose} rights, and on some farms each site has its own sign-in, so a new \
-                 site starts signed out even when your other sites are signed in.{KEY_ASIDE}"
+                 then try again. This needs {whose} rights.{KEY_ASIDE}"
             )
         }
         Some(a) => {

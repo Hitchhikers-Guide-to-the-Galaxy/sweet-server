@@ -1005,7 +1005,14 @@ fn api_gate(entry: &api::Mounted, ctx: &api::SiteContext, auth: &Auth) -> Option
         if api::authorize_key(Path::new(&ctx.status), auth.api_key.as_deref(), &scope).is_some() {
             return None;
         }
-        api::write_refusal(&ctx.origin, auth.authorized, &scope, &entry.op)
+        let asker = api::Asker {
+            signed_in: auth.user,
+            name: auth.oauth2_identity.as_ref().and_then(|v| {
+                ["name", "username", "id"].iter().find_map(|k| v[*k].as_str().map(String::from))
+            }),
+            owner: api::owner_name_at(&ctx.status),
+        };
+        api::write_refusal(&ctx.origin, auth.authorized, &scope, &entry.op, Some(&asker))
     });
     let (status, msg) = refusal?;
     Some(

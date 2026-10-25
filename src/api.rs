@@ -980,6 +980,7 @@ pub fn write_refusal(
     authorized: bool,
     scope: &str,
     op: &Value,
+    asker: Option<&Asker>,
 ) -> Option<(u16, String)> {
     let what = if scope.is_empty() { "this operation" } else { scope };
     if !is_private_site(origin) && public_writes_refused(Some(scope)) {
@@ -1007,12 +1008,50 @@ pub fn write_refusal(
         return None;
     }
     if !authorized {
-        return Some((403, format!(
-            "changing a page on {origin} needs the rights to edit it — sign in to this \
-             wiki as its owner, or present an X-Api-Key listed in its status/api-keys.json"
-        )));
+        return Some((403, rights_refusal(origin, asker)));
     }
     None
+}
+
+/// Who is asking, when the server can say (gate.js signedInAs, farm 0.10.3).
+pub struct Asker {
+    pub signed_in: bool,
+    pub name: Option<String>,
+    pub owner: Option<String>,
+}
+
+const KEY_ASIDE: &str = " (Scripts and agents can present an X-Api-Key listed in the site's status/api-keys.json instead.)";
+
+/// gate.js rightsRefusal (farm 0.10.3): the commonest refusal is a missing
+/// sign-in, so say that first and plainly; a stranger is told whose site it
+/// is; a server that cannot tell keeps the old wording.
+pub fn rights_refusal(origin: &str, asker: Option<&Asker>) -> String {
+    match asker {
+        Some(a) if !a.signed_in => {
+            let whose = a.owner.as_deref().map(|o| format!("{o}'s")).unwrap_or_else(|| "the site owner's".into());
+            format!(
+                "You are not signed in on {origin}. Sign in there first — use the sign-in lock at the foot of the page — \
+                 then try again. This needs {whose} rights, and on some farms each site has its own sign-in, so a new \
+                 site starts signed out even when your other sites are signed in.{KEY_ASIDE}"
+            )
+        }
+        Some(a) => {
+            let who = a.name.as_deref().unwrap_or("someone");
+            let belongs = a.owner.as_deref().map(|o| format!(", and it belongs to {o}")).unwrap_or_default();
+            format!("You are signed in on {origin} as {who}, but this needs the rights to edit it{belongs}. Sign in as its owner to do this.{KEY_ASIDE}")
+        }
+        None => format!(
+            "changing a page on {origin} needs the rights to edit it — sign in to this \
+             wiki as its owner, or present an X-Api-Key listed in its status/api-keys.json"
+        ),
+    }
+}
+
+/// The owner's display name from a site's status/owner.json, if any.
+pub fn owner_name_at(status: &str) -> Option<String> {
+    let text = std::fs::read_to_string(Path::new(status).join("owner.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v["name"].as_str().filter(|s| !s.is_empty()).map(String::from)
 }
 
 /// gate.js crossOriginAllowed (farm 0.9.1): an operation that declares
@@ -1849,7 +1888,7 @@ pub fn try_operation(
         let keyed = authorize_key(Path::new(&ctx.status), api_key, &scope).is_some();
         if !keyed {
             // try.js (farm 0.10.0) passes the entry's gate, spends and privateOnly
-            if let Some((_, why)) = write_refusal(&ctx.origin, authorized, &scope, &entry.op) {
+            if let Some((_, why)) = write_refusal(&ctx.origin, authorized, &scope, &entry.op, None) {
                 return render_problem(
                     "Not allowed to change that",
                     &why,

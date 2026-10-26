@@ -27,6 +27,7 @@ use std::sync::Arc;
 mod actions;
 mod api;
 mod assets;
+mod client_layer;
 mod indexes;
 mod oidc;
 mod oneclick;
@@ -1349,9 +1350,15 @@ fn route(site: &Site, path: &str, auth: Auth) -> Response {
             match site
                 .vendor
                 .as_ref()
-                .and_then(|v| read(&v.join(package).join(file)))
+                .and_then(|v| read(&v.join(package).join(file)).map(|b| (v, b)))
             {
-                Some(bytes) => serve_bytes(bytes, guess_mime(p)),
+                // security.js also carries the hitchhiker client layer
+                // (the chooser), as our node security modules do
+                Some((v, mut bytes)) if file == "security.js" => {
+                    bytes.extend_from_slice(client_layer::bootstrap(v).as_bytes());
+                    serve_bytes(bytes, guess_mime(p))
+                }
+                Some((_, bytes)) => serve_bytes(bytes, guess_mime(p)),
                 None => not_found("Not found"),
             }
         }
